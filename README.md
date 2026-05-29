@@ -129,3 +129,4 @@ gcloud billing budgets create --billing-account="$BILLING_ACCOUNT_ID" --display-
 - 長時間動画はCloud Run service内処理では重くなる可能性があります
 - 本格運用ではタイムラプス処理をCloud Run Jobsへ分離推奨
 - ログインなし、`--allow-unauthenticated` なのでCloud Run URLの共有に注意
+# study-log-timerapse
