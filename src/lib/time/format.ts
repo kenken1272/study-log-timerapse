@@ -26,3 +26,20 @@ export function dateInputValue(date: Date): string {
   const day = `${date.getDate()}`.padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
+
+export function formatBytes(bytes: number): string {
+  const safeBytes = Math.max(0, bytes);
+  if (safeBytes < 1024) {
+    return `${safeBytes}B`;
+  }
+
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = safeBytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${value.toFixed(value >= 10 ? 0 : 1)}${units[unitIndex]}`;
+}

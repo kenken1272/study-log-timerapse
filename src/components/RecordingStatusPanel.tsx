@@ -6,6 +6,8 @@ type RecordingStatusPanelProps = {
   targetStudySec: number;
   isBreakActive: boolean;
   isBusy: boolean;
+  isOnline: boolean;
+  pendingUploadCount: number;
   onToggleBreak: () => void;
   onStop: () => void;
 };
@@ -15,6 +17,8 @@ export function RecordingStatusPanel({
   targetStudySec,
   isBreakActive,
   isBusy,
+  isOnline,
+  pendingUploadCount,
   onToggleBreak,
   onStop,
 }: RecordingStatusPanelProps) {
@@ -55,7 +59,21 @@ export function RecordingStatusPanel({
       <div className="mt-6 h-3 overflow-hidden rounded-full bg-zinc-100">
         <div className="h-full bg-emerald-500" style={{ width: `${progress}%` }} />
       </div>
-      <p className="mt-3 text-sm text-amber-700">このタブを閉じないでください</p>
+      <div className="mt-4 flex flex-wrap items-center gap-3 text-sm">
+        <span
+          className={
+            isOnline
+              ? "rounded-full bg-emerald-50 px-3 py-1 text-emerald-700"
+              : "rounded-full bg-amber-50 px-3 py-1 text-amber-700"
+          }
+        >
+          {isOnline ? "オンライン" : "オフライン。動画は一時保存中です"}
+        </span>
+        <span className="rounded-full bg-zinc-100 px-3 py-1 text-zinc-700">
+          未アップロードchunk {pendingUploadCount}件
+        </span>
+        <span className="text-orange-700">このタブを閉じないでください</span>
+      </div>
     </section>
   );
 }

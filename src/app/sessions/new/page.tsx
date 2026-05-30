@@ -13,9 +13,6 @@ export default function NewSessionPage() {
           <ArrowLeft size={16} />
           ダッシュボードへ
         </Link>
-        <header className="my-8">
-          <h1 className="text-3xl font-semibold tracking-normal">勉強セッション開始</h1>
-        </header>
         <CameraRecorder />
       </div>
     </main>

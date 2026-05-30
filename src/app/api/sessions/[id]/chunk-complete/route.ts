@@ -18,9 +18,16 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = await readJsonRecord(request);
+    const segmentIndex =
+      body.segmentIndex === undefined ? 0 : integerValue(body.segmentIndex, "segmentIndex");
+    const chunkIndex =
+      body.chunkIndex === undefined
+        ? integerValue(body.index, "index")
+        : integerValue(body.chunkIndex, "chunkIndex");
     await registerChunk({
       sessionId: id,
-      index: integerValue(body.index, "index"),
+      segmentIndex,
+      index: chunkIndex,
       objectPath: requiredString(body.objectPath, "objectPath", 1000),
       sizeBytes: nonNegativeNumber(body.sizeBytes, "sizeBytes"),
     });

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { finishSession, toJsonSession } from "@/lib/sessions/firestore";
+import { finishSession, getSession, toJsonSession } from "@/lib/sessions/firestore";
 import {
   optionalString,
   qualityValue,
@@ -18,6 +18,14 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = await readJsonRecord(request);
+    const existing = await getSession(id);
+    if (!existing) {
+      throw new Error("Session not found.");
+    }
+    if (existing.uploadStatus === "offline_pending" || existing.uploadStatus === "uploading") {
+      throw new Error("未アップロードchunkがあります。アップロード完了後に終了してください。");
+    }
+
     const session = await finishSession({
       sessionId: id,
       studyContent: requiredString(body.studyContent, "studyContent", 1000),

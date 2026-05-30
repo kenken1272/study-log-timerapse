@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Save } from "lucide-react";
 import { QualitySelector } from "@/components/QualitySelector";
+import { StudyMinutesControl } from "@/components/StudyMinutesControl";
 import type { JsonStudySession, StudyQuality } from "@/lib/sessions/types";
 import { dateInputValue } from "@/lib/time/format";
 
@@ -72,16 +73,11 @@ export default function OfflineSessionPage() {
             />
           </label>
           <div className="grid gap-4 md:grid-cols-2">
-            <label className="block">
-              <span className="text-sm font-medium text-zinc-700">勉強時間（分）</span>
-              <input
-                type="number"
-                min={1}
-                value={studyMinutes}
-                onChange={(event) => setStudyMinutes(Number(event.target.value))}
-                className="mt-2 w-full rounded-md border border-zinc-300 px-3 py-2 outline-none focus:border-emerald-500"
-              />
-            </label>
+            <StudyMinutesControl
+              label="勉強時間（分）"
+              value={studyMinutes}
+              onChange={setStudyMinutes}
+            />
             <label className="block">
               <span className="text-sm font-medium text-zinc-700">休憩時間（分）</span>
               <input

@@ -4,6 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, Pencil, RotateCw, Save, Trash2, X } from "lucide-react";
+import { AnalysisResultCard } from "@/components/AnalysisResultCard";
+import { AnalyzeButton } from "@/components/AnalyzeButton";
+import { LocalAnalyzeButton } from "@/components/LocalAnalyzeButton";
 import { QualitySelector } from "@/components/QualitySelector";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import type { JsonStudySession, StudyQuality } from "@/lib/sessions/types";
@@ -63,6 +66,34 @@ export default function SessionDetailPage() {
       cancelled = true;
     };
   }, [params.id]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+
+    const shouldPoll =
+      session.status === "processing" ||
+      session.analysisStatus === "processing" ||
+      session.localAnalysisStatus === "processing";
+    if (!shouldPoll) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadSession().catch((loadError: unknown) => {
+        setError(loadError instanceof Error ? loadError.message : "読み込みに失敗しました。");
+      });
+    }, 3000);
+
+    return () => window.clearInterval(intervalId);
+  }, [
+    loadSession,
+    session,
+    session?.analysisStatus,
+    session?.localAnalysisStatus,
+    session?.status,
+  ]);
 
   async function handleProcess() {
     setIsProcessing(true);
@@ -166,7 +197,6 @@ export default function SessionDetailPage() {
     ],
     ["クオリティ", session.quality ? `${session.quality} / 5` : "-"],
   ];
-
   return (
     <main className="min-h-screen bg-zinc-50 text-zinc-950">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-8 md:px-6">
@@ -286,6 +316,43 @@ export default function SessionDetailPage() {
             <p className="mt-3 text-sm text-red-700">{session.errorMessage}</p>
           ) : null}
         </section>
+
+        {session.type === "recorded" && session.timelapsePath ? (
+          <section className="rounded-lg border border-zinc-200 bg-white p-5">
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <h2 className="text-xl font-semibold">集中度分析</h2>
+                <p className="mt-2 text-sm text-zinc-500">
+                  分析は自動では実行されません。ボタンを押したときだけ実行されます。
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <AnalyzeButton session={session} onAnalyzed={setSession} />
+                <LocalAnalyzeButton session={session} onAnalyzed={setSession} />
+              </div>
+            </div>
+            <div className="mt-5 grid gap-4 md:grid-cols-2">
+              <div className="rounded-lg border border-zinc-100 bg-zinc-50 p-4">
+                <AnalysisResultCard
+                  title="Gemini分析"
+                  model={session.analysisModel}
+                  status={session.analysisStatus}
+                  result={session.analysisResult}
+                  errorMessage={session.analysisErrorMessage}
+                />
+              </div>
+              <div className="rounded-lg border border-zinc-100 bg-zinc-50 p-4">
+                <AnalysisResultCard
+                  title="ローカル分析"
+                  model={session.localAnalysisModel ?? "Qwen2.5-VL"}
+                  status={session.localAnalysisStatus}
+                  result={session.localAnalysisResult}
+                  errorMessage={session.localAnalysisErrorMessage}
+                />
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         <section className="grid gap-4 md:grid-cols-2">
           <div className="rounded-lg border border-zinc-200 bg-white p-5">

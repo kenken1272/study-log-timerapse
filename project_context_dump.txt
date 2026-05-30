@@ -1,0 +1,1937 @@
+============================================================
+1. 既存リポジトリのファイル構成
+============================================================
+/Users/nishimurakenta/programingfile/study-log
+
+.
+./.DS_Store
+./.dockerignore
+./.env.example
+./.gcloudignore
+./.gitignore
+./AGENTS.md
+./CLAUDE.md
+./Dockerfile
+./README.md
+./check_status.sh
+./cors.json
+./deploy_cloudrun.sh
+./dump_project_context.sh
+./eslint.config.mjs
+./fix_vertex_ai_and_redeploy.sh
+./next-env.d.ts
+./next.config.ts
+./package-lock.json
+./package.json
+./postcss.config.mjs
+./project_context_dump.txt
+./public
+./public/.keep
+./public/file.svg
+./public/globe.svg
+./public/next.svg
+./public/timelapse-preview.svg
+./public/vercel.svg
+./public/window.svg
+./redeploy_cloudrun.sh
+./redeploy_cloudrun_with_vertex_fix.sh
+./src
+./src/.DS_Store
+./src/app
+./src/app/.DS_Store
+./src/app/api
+./src/app/api/offline-sessions
+./src/app/api/offline-sessions/route.ts
+./src/app/api/sessions
+./src/app/api/sessions/[id]
+./src/app/api/sessions/[id]/analyze
+./src/app/api/sessions/[id]/analyze/route.ts
+./src/app/api/sessions/[id]/break
+./src/app/api/sessions/[id]/break/end
+./src/app/api/sessions/[id]/break/end/route.ts
+./src/app/api/sessions/[id]/break/start
+./src/app/api/sessions/[id]/break/start/route.ts
+./src/app/api/sessions/[id]/chunk-complete
+./src/app/api/sessions/[id]/chunk-complete/route.ts
+./src/app/api/sessions/[id]/finish
+./src/app/api/sessions/[id]/finish/route.ts
+./src/app/api/sessions/[id]/heartbeat
+./src/app/api/sessions/[id]/heartbeat/route.ts
+./src/app/api/sessions/[id]/interrupt
+./src/app/api/sessions/[id]/interrupt/route.ts
+./src/app/api/sessions/[id]/process
+./src/app/api/sessions/[id]/process/route.ts
+./src/app/api/sessions/[id]/resume
+./src/app/api/sessions/[id]/resume/route.ts
+./src/app/api/sessions/[id]/route.ts
+./src/app/api/sessions/[id]/thumbnail-url
+./src/app/api/sessions/[id]/thumbnail-url/route.ts
+./src/app/api/sessions/[id]/upload-pending
+./src/app/api/sessions/[id]/upload-pending/route.ts
+./src/app/api/sessions/[id]/upload-url
+./src/app/api/sessions/[id]/upload-url/route.ts
+./src/app/api/sessions/[id]/video-url
+./src/app/api/sessions/[id]/video-url/route.ts
+./src/app/api/sessions/resumable
+./src/app/api/sessions/resumable/route.ts
+./src/app/api/sessions/route.ts
+./src/app/api/sessions/stats
+./src/app/api/sessions/stats/route.ts
+./src/app/api/settings
+./src/app/api/settings/weekly-goal
+./src/app/api/settings/weekly-goal/route.ts
+./src/app/earnings
+./src/app/earnings/page.tsx
+./src/app/favicon.ico
+./src/app/globals.css
+./src/app/layout.tsx
+./src/app/offline
+./src/app/offline/new
+./src/app/offline/new/page.tsx
+./src/app/page.tsx
+./src/app/sessions
+./src/app/sessions/[id]
+./src/app/sessions/[id]/page.tsx
+./src/app/sessions/new
+./src/app/sessions/new/page.tsx
+./src/app/settings
+./src/app/settings/weekly-goal
+./src/app/settings/weekly-goal/page.tsx
+./src/components
+./src/components/AnalysisResultCard.tsx
+./src/components/AnalyzeButton.tsx
+./src/components/CameraRecorder.tsx
+./src/components/QualitySelector.tsx
+./src/components/RecordingStatusPanel.tsx
+./src/components/SessionCard.tsx
+./src/components/SessionThumbnail.tsx
+./src/components/SmallCameraPreview.tsx
+./src/components/StatsCards.tsx
+./src/components/VideoPlayer.tsx
+./src/components/WeeklyGoalCard.tsx
+./src/lib
+./src/lib/client
+./src/lib/client/chunkStore.ts
+./src/lib/client/network.ts
+./src/lib/client/sessionResume.ts
+./src/lib/firebase
+./src/lib/firebase/admin.ts
+./src/lib/gcp
+./src/lib/gcp/storage.ts
+./src/lib/sessions
+./src/lib/sessions/firestore.ts
+./src/lib/sessions/stats.ts
+./src/lib/sessions/types.ts
+./src/lib/time
+./src/lib/time/format.ts
+./src/lib/validation.ts
+./src/lib/vertex
+./src/lib/vertex/analyzeStudyVideo.ts
+./src/lib/vertex/types.ts
+./src/lib/video
+./src/lib/video/processTimelapse.ts
+./tsconfig.json
+./tsconfig.tsbuildinfo
+
+============================================================
+2. Gemini分析APIの現在の実装ファイル
+============================================================
+
+------------------------------------------------------------
+src/app/api/sessions/[id]/analyze/route.ts
+------------------------------------------------------------
+import { NextResponse } from "next/server";
+import { analyzeStudyVideo, getVertexModelName } from "@/lib/vertex/analyzeStudyVideo";
+import {
+  getSession,
+  toJsonSession,
+  updateSessionAnalysisDone,
+  updateSessionAnalysisFailed,
+  updateSessionAnalysisProcessing,
+} from "@/lib/sessions/firestore";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function POST(_request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const model = getVertexModelName();
+
+  try {
+    const session = await getSession(id);
+    if (!session) {
+      return NextResponse.json({ error: "Session not found." }, { status: 404 });
+    }
+    if (session.status !== "ready" || !session.timelapsePath) {
+      return NextResponse.json(
+        { error: "Timelapse video must be ready before analysis." },
+        { status: 400 },
+      );
+    }
+
+    await updateSessionAnalysisProcessing({ sessionId: id, model });
+    const analysis = await analyzeStudyVideo(session.timelapsePath);
+    await updateSessionAnalysisDone({
+      sessionId: id,
+      model: analysis.model,
+      analysisResult: analysis.result,
+    });
+    const updated = await getSession(id);
+    if (!updated) {
+      return NextResponse.json({ error: "Session not found after analysis." }, { status: 404 });
+    }
+
+    return NextResponse.json({ session: toJsonSession(updated) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Analysis failed.";
+    await updateSessionAnalysisFailed({ sessionId: id, model, errorMessage: message }).catch(
+      () => undefined,
+    );
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+------------------------------------------------------------
+src/lib/vertex/analyzeStudyVideo.ts
+------------------------------------------------------------
+import { SchemaType, VertexAI } from "@google-cloud/vertexai";
+import { getBucketName } from "@/lib/gcp/storage";
+import type { AnalysisResult } from "@/lib/sessions/types";
+import { parseAnalysisResult } from "@/lib/vertex/types";
+
+const ANALYSIS_PROMPT = `あなたは勉強記録動画を分析するアシスタントです。
+
+この動画は、ユーザーが勉強している様子をタイムラプス化したものです。
+映像から見える行動だけを根拠に、勉強集中度を0〜100で評価してください。
+
+評価基準:
+
+* 机に向かっている時間
+* 書く、読む、PC作業などの勉強行動
+* 離席時間
+* スマホ操作らしき行動
+* 寝ている、ぼーっとしている、画面外にいる時間
+* 休憩らしき時間
+
+重要な注意:
+
+* 本人の内面、感情、性格、健康状態を断定しない
+* 顔、年齢、性別、個人属性を推測しない
+* 映像から確認できる行動だけを根拠にする
+* 不確実な場合は不確実と書く
+* 医療的、心理的な診断をしない
+* 必ずJSONだけで返す
+* Markdownや説明文をJSONの外に出さない
+
+出力形式:
+{
+"focusScore": number,
+"focusLabel": "かなり低い" | "低い" | "普通" | "高い" | "とても高い",
+"studyDetected": boolean,
+"estimatedAbsenceMinutes": number,
+"estimatedPhoneUseMinutes": number,
+"estimatedWritingReadingMinutes": number,
+"summary": string,
+"evidence": string[],
+"uncertainty": string,
+"advice": string
+}`;
+
+export function getVertexModelName(): string {
+  return process.env.VERTEX_MODEL ?? "gemini-2.5-pro";
+}
+
+export async function analyzeStudyVideo(
+  timelapsePath: string,
+): Promise<{ result: AnalysisResult; model: string }> {
+  const project = process.env.GCP_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT ?? "vla-test1";
+  const location = process.env.VERTEX_LOCATION ?? "us-central1";
+  const model = getVertexModelName();
+  const maxOutputTokens = Number(process.env.ANALYSIS_MAX_OUTPUT_TOKENS ?? 2048);
+  const vertexAI = new VertexAI({ project, location });
+  const generativeModel = vertexAI.getGenerativeModel({
+    model,
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: Number.isFinite(maxOutputTokens) ? maxOutputTokens : 2048,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: SchemaType.OBJECT,
+        properties: {
+          focusScore: { type: SchemaType.NUMBER },
+          focusLabel: { type: SchemaType.STRING },
+          studyDetected: { type: SchemaType.BOOLEAN },
+          estimatedAbsenceMinutes: { type: SchemaType.NUMBER },
+          estimatedPhoneUseMinutes: { type: SchemaType.NUMBER },
+          estimatedWritingReadingMinutes: { type: SchemaType.NUMBER },
+          summary: { type: SchemaType.STRING },
+          evidence: {
+            type: SchemaType.ARRAY,
+            items: { type: SchemaType.STRING },
+          },
+          uncertainty: { type: SchemaType.STRING },
+          advice: { type: SchemaType.STRING },
+        },
+        required: [
+          "focusScore",
+          "focusLabel",
+          "studyDetected",
+          "estimatedAbsenceMinutes",
+          "estimatedPhoneUseMinutes",
+          "estimatedWritingReadingMinutes",
+          "summary",
+          "evidence",
+          "uncertainty",
+          "advice",
+        ],
+      },
+    },
+  });
+  const uri = `gs://${getBucketName()}/${timelapsePath}`;
+  const response = await generativeModel.generateContent({
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            fileData: {
+              fileUri: uri,
+              mimeType: "video/mp4",
+            },
+          },
+          { text: ANALYSIS_PROMPT },
+        ],
+      },
+    ],
+  });
+  const generated = await response.response;
+  const text = generated.candidates?.[0]?.content?.parts
+    ?.map((part) => ("text" in part && typeof part.text === "string" ? part.text : ""))
+    .join("");
+  if (!text) {
+    throw new Error("Vertex AI response did not include text.");
+  }
+
+  return {
+    result: parseAnalysisResult(text),
+    model,
+  };
+}
+
+------------------------------------------------------------
+src/lib/vertex/types.ts
+------------------------------------------------------------
+import type { AnalysisResult, FocusLabel } from "@/lib/sessions/types";
+
+const focusLabels: FocusLabel[] = ["かなり低い", "低い", "普通", "高い", "とても高い"];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function numberInRange(value: unknown, min: number, max: number, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+    throw new Error(`${field} must be a number between ${min} and ${max}.`);
+  }
+
+  return value;
+}
+
+function nonNegativeNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative number.`);
+  }
+
+  return value;
+}
+
+function stringValue(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${field} must be a string.`);
+  }
+
+  return value;
+}
+
+function focusLabelValue(value: unknown): FocusLabel {
+  if (focusLabels.includes(value as FocusLabel)) {
+    return value as FocusLabel;
+  }
+
+  throw new Error("focusLabel is invalid.");
+}
+
+function stringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${field} must be an array.`);
+  }
+
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .slice(0, 10);
+}
+
+export function extractJsonText(text: string): string {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+
+  return trimmed;
+}
+
+export function parseAnalysisResult(text: string): AnalysisResult {
+  const parsed = JSON.parse(extractJsonText(text)) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error("Analysis response must be a JSON object.");
+  }
+
+  const studyDetected = parsed.studyDetected;
+  if (typeof studyDetected !== "boolean") {
+    throw new Error("studyDetected must be boolean.");
+  }
+
+  return {
+    focusScore: numberInRange(parsed.focusScore, 0, 100, "focusScore"),
+    focusLabel: focusLabelValue(parsed.focusLabel),
+    studyDetected,
+    estimatedAbsenceMinutes: nonNegativeNumber(
+      parsed.estimatedAbsenceMinutes,
+      "estimatedAbsenceMinutes",
+    ),
+    estimatedPhoneUseMinutes: nonNegativeNumber(
+      parsed.estimatedPhoneUseMinutes,
+      "estimatedPhoneUseMinutes",
+    ),
+    estimatedWritingReadingMinutes: nonNegativeNumber(
+      parsed.estimatedWritingReadingMinutes,
+      "estimatedWritingReadingMinutes",
+    ),
+    summary: stringValue(parsed.summary, "summary"),
+    evidence: stringArray(parsed.evidence, "evidence"),
+    uncertainty: stringValue(parsed.uncertainty, "uncertainty"),
+    advice: stringValue(parsed.advice, "advice"),
+  };
+}
+
+------------------------------------------------------------
+src/components/AnalyzeButton.tsx
+------------------------------------------------------------
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Sparkles } from "lucide-react";
+import type { JsonStudySession } from "@/lib/sessions/types";
+
+type AnalyzeButtonProps = {
+  session: JsonStudySession;
+  onAnalyzed?: (session: JsonStudySession) => void;
+  compact?: boolean;
+};
+
+function labelForStatus(status: JsonStudySession["analysisStatus"]): string {
+  if (status === "done") {
+    return "再分析";
+  }
+  if (status === "failed") {
+    return "分析再実行";
+  }
+  if (status === "processing") {
+    return "分析中";
+  }
+
+  return "Geminiで集中度分析";
+}
+
+export function AnalyzeButton({ session, onAnalyzed, compact = false }: AnalyzeButtonProps) {
+  const router = useRouter();
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const canAnalyze = session.status === "ready" && session.timelapsePath !== null;
+
+  async function handleAnalyze() {
+    setIsAnalyzing(true);
+    try {
+      const response = await fetch(`/api/sessions/${session.id}/analyze`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? "分析に失敗しました。");
+      }
+
+      const body = (await response.json()) as { session: JsonStudySession };
+      onAnalyzed?.(body.session);
+      router.refresh();
+    } catch {
+      router.refresh();
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleAnalyze}
+      disabled={!canAnalyze || isAnalyzing || session.analysisStatus === "processing"}
+      className={
+        compact
+          ? "inline-flex items-center gap-2 rounded-md bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700 disabled:opacity-50"
+          : "inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-white hover:bg-emerald-700 disabled:opacity-50"
+      }
+    >
+      <Sparkles size={compact ? 16 : 18} />
+      {isAnalyzing ? "分析中" : labelForStatus(session.analysisStatus)}
+    </button>
+  );
+}
+
+------------------------------------------------------------
+src/components/AnalysisResultCard.tsx
+------------------------------------------------------------
+import type { AnalysisResult, AnalysisStatus } from "@/lib/sessions/types";
+
+type AnalysisResultCardProps = {
+  status: AnalysisStatus;
+  result: AnalysisResult | null;
+  errorMessage: string | null;
+};
+
+function minutes(value: number): string {
+  return `${Math.round(value)}分`;
+}
+
+export function AnalysisResultCard({
+  status,
+  result,
+  errorMessage,
+}: AnalysisResultCardProps) {
+  if (status === "none" || status === "pending") {
+    return <p className="text-sm text-zinc-500">まだ分析されていません。</p>;
+  }
+  if (status === "processing") {
+    return <p className="text-sm text-zinc-500">分析中です。数分かかる場合があります。</p>;
+  }
+  if (status === "failed") {
+    return (
+      <p className="text-sm text-red-700">
+        {errorMessage ?? "分析に失敗しました。"}
+      </p>
+    );
+  }
+  if (!result) {
+    return <p className="text-sm text-zinc-500">分析結果がありません。</p>;
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-3 md:grid-cols-4">
+        <div className="rounded-lg bg-emerald-50 p-4 text-emerald-950">
+          <p className="text-sm opacity-75">集中度</p>
+          <p className="mt-1 text-3xl font-semibold">{result.focusScore}点</p>
+          <p className="mt-1 text-sm font-medium">{result.focusLabel}</p>
+        </div>
+        <div className="rounded-lg bg-zinc-50 p-4">
+          <p className="text-sm text-zinc-500">勉強検出</p>
+          <p className="mt-1 text-lg font-semibold">
+            {result.studyDetected ? "あり" : "不明"}
+          </p>
+        </div>
+        <div className="rounded-lg bg-zinc-50 p-4">
+          <p className="text-sm text-zinc-500">離席推定</p>
+          <p className="mt-1 text-lg font-semibold">
+            {minutes(result.estimatedAbsenceMinutes)}
+          </p>
+        </div>
+        <div className="rounded-lg bg-zinc-50 p-4">
+          <p className="text-sm text-zinc-500">読み書き推定</p>
+          <p className="mt-1 text-lg font-semibold">
+            {minutes(result.estimatedWritingReadingMinutes)}
+          </p>
+        </div>
+      </div>
+      <div>
+        <h3 className="font-semibold">要約</h3>
+        <p className="mt-2 text-sm leading-6 text-zinc-700">{result.summary}</p>
+      </div>
+      <div className="grid gap-4 md:grid-cols-2">
+        <div>
+          <h3 className="font-semibold">根拠</h3>
+          <ul className="mt-2 space-y-2 text-sm text-zinc-700">
+            {result.evidence.map((item) => (
+              <li key={item}>・{item}</li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <h3 className="font-semibold">アドバイス</h3>
+          <p className="mt-2 text-sm leading-6 text-zinc-700">{result.advice}</p>
+          <h3 className="mt-4 font-semibold">不確実性</h3>
+          <p className="mt-2 text-sm leading-6 text-zinc-700">{result.uncertainty}</p>
+          <p className="mt-4 text-sm text-zinc-500">
+            推定スマホ操作: {minutes(result.estimatedPhoneUseMinutes)}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+============================================================
+3. セッション詳細ページの実装ファイル
+============================================================
+
+------------------------------------------------------------
+src/app/sessions/[id]/page.tsx
+------------------------------------------------------------
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import { useParams, useRouter } from "next/navigation";
+import { ArrowLeft, Pencil, RotateCw, Save, Trash2, X } from "lucide-react";
+import { AnalysisResultCard } from "@/components/AnalysisResultCard";
+import { AnalyzeButton } from "@/components/AnalyzeButton";
+import { QualitySelector } from "@/components/QualitySelector";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import type { JsonStudySession, StudyQuality } from "@/lib/sessions/types";
+import { formatDuration, formatShortDate } from "@/lib/time/format";
+
+export default function SessionDetailPage() {
+  const params = useParams<{ id: string }>();
+  const router = useRouter();
+  const [session, setSession] = useState<JsonStudySession | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [editStudyContent, setEditStudyContent] = useState("");
+  const [editQuality, setEditQuality] = useState<StudyQuality>(3);
+  const [editReflectionNote, setEditReflectionNote] = useState("");
+
+  const loadSession = useCallback(async () => {
+    const response = await fetch(`/api/sessions/${params.id}`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error("セッションを取得できませんでした。");
+    }
+    const body = (await response.json()) as { session: JsonStudySession };
+    setSession(body.session);
+    setEditStudyContent(body.session.studyContent ?? "");
+    setEditQuality(body.session.quality ?? 3);
+    setEditReflectionNote(body.session.reflectionNote ?? "");
+  }, [params.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch(`/api/sessions/${params.id}`, { cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("セッションを取得できませんでした。");
+        }
+
+        return response.json() as Promise<{ session: JsonStudySession }>;
+      })
+      .then((body) => {
+        if (!cancelled) {
+          setSession(body.session);
+          setEditStudyContent(body.session.studyContent ?? "");
+          setEditQuality(body.session.quality ?? 3);
+          setEditReflectionNote(body.session.reflectionNote ?? "");
+        }
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : "読み込みに失敗しました。");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [params.id]);
+
+  async function handleProcess() {
+    setIsProcessing(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/sessions/${params.id}/process`, { method: "POST" });
+      if (!response.ok) {
+        throw new Error("タイムラプス生成に失敗しました。");
+      }
+      await loadSession();
+    } catch (processError) {
+      setError(
+        processError instanceof Error ? processError.message : "タイムラプス生成に失敗しました。",
+      );
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleSaveEdit() {
+    if (!session) {
+      return;
+    }
+
+    setIsSaving(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/sessions/${session.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          studyContent: editStudyContent,
+          quality: editQuality,
+          reflectionNote: editReflectionNote,
+        }),
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? "更新に失敗しました。");
+      }
+
+      const body = (await response.json()) as { session: JsonStudySession };
+      setSession(body.session);
+      setIsEditing(false);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "更新に失敗しました。");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!session) {
+      return;
+    }
+    const confirmed = window.confirm(
+      "このセッションを削除します。録画chunk、タイムラプス動画、サムネイルも削除されます。",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsDeleting(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/sessions/${session.id}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? "削除に失敗しました。");
+      }
+
+      router.push("/");
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "削除に失敗しました。");
+      setIsDeleting(false);
+    }
+  }
+
+  if (!session) {
+    return (
+      <main className="min-h-screen bg-zinc-50 px-4 py-8 text-zinc-950">
+        <div className="mx-auto max-w-4xl rounded-lg border border-zinc-200 bg-white p-6">
+          {error ?? "読み込み中..."}
+        </div>
+      </main>
+    );
+  }
+
+  const metrics = [
+    ["開始", formatShortDate(session.startedAt)],
+    ["終了", session.endedAt ? formatShortDate(session.endedAt) : "-"],
+    ["目標", session.targetStudySec ? formatDuration(session.targetStudySec) : "-"],
+    ["全体時間", session.totalElapsedSec ? formatDuration(session.totalElapsedSec) : "-"],
+    ["休憩時間", formatDuration(session.totalBreakSec)],
+    ["実勉強時間", formatDuration(session.actualStudySec)],
+    [
+      "達成率",
+      session.achievementRate === null ? "-" : `${Math.round(session.achievementRate)}%`,
+    ],
+    ["クオリティ", session.quality ? `${session.quality} / 5` : "-"],
+  ];
+  return (
+    <main className="min-h-screen bg-zinc-50 text-zinc-950">
+      <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-8 md:px-6">
+        <Link
+          href="/"
+          className="inline-flex w-fit items-center gap-2 text-sm text-zinc-600 hover:text-zinc-950"
+        >
+          <ArrowLeft size={16} />
+          ダッシュボードへ
+        </Link>
+        <header className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+          <div>
+            <p className="text-sm text-zinc-500">
+              {session.type === "offline" ? "オフライン入力" : "録画セッション"}
+            </p>
+            <h1 className="mt-1 text-3xl font-semibold tracking-normal">
+              {session.studyContent ?? "勉強セッション"}
+            </h1>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="w-fit rounded-full bg-zinc-900 px-3 py-1 text-sm text-white">
+              {session.status}
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsEditing((current) => !current)}
+              className="inline-flex items-center gap-2 rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-800 hover:bg-zinc-50"
+            >
+              {isEditing ? <X size={16} /> : <Pencil size={16} />}
+              {isEditing ? "閉じる" : "編集"}
+            </button>
+            <button
+              type="button"
+              onClick={handleDelete}
+              disabled={isDeleting}
+              className="inline-flex items-center gap-2 rounded-md border border-red-200 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50 disabled:opacity-50"
+            >
+              <Trash2 size={16} />
+              削除
+            </button>
+          </div>
+        </header>
+
+        {error ? (
+          <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+            {error}
+          </div>
+        ) : null}
+
+        <section className="grid gap-3 md:grid-cols-4">
+          {metrics.map(([label, value]) => (
+            <div key={label} className="rounded-lg border border-zinc-200 bg-white p-4">
+              <p className="text-sm text-zinc-500">{label}</p>
+              <p className="mt-2 font-semibold">{value}</p>
+            </div>
+          ))}
+        </section>
+
+        {isEditing ? (
+          <section className="rounded-lg border border-zinc-200 bg-white p-5">
+            <h2 className="text-xl font-semibold">セッション編集</h2>
+            <div className="mt-4 space-y-5">
+              <label className="block">
+                <span className="text-sm font-medium text-zinc-700">勉強内容</span>
+                <input
+                  value={editStudyContent}
+                  onChange={(event) => setEditStudyContent(event.target.value)}
+                  className="mt-2 w-full rounded-md border border-zinc-300 px-3 py-2 outline-none focus:border-emerald-500"
+                />
+              </label>
+              <div>
+                <p className="mb-2 text-sm font-medium text-zinc-700">勉強クオリティ</p>
+                <QualitySelector value={editQuality} onChange={setEditQuality} />
+              </div>
+              <label className="block">
+                <span className="text-sm font-medium text-zinc-700">メモ</span>
+                <textarea
+                  value={editReflectionNote}
+                  onChange={(event) => setEditReflectionNote(event.target.value)}
+                  className="mt-2 min-h-28 w-full rounded-md border border-zinc-300 px-3 py-2 outline-none focus:border-emerald-500"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={handleSaveEdit}
+                disabled={isSaving}
+                className="inline-flex items-center gap-2 rounded-md bg-zinc-950 px-4 py-2 text-white hover:bg-zinc-800 disabled:opacity-50"
+              >
+                <Save size={18} />
+                保存
+              </button>
+            </div>
+          </section>
+        ) : null}
+
+        <section className="rounded-lg border border-zinc-200 bg-white p-5">
+          <h2 className="text-xl font-semibold">タイムラプス動画</h2>
+          <div className="mt-4">
+            {session.type === "recorded" ? (
+              <VideoPlayer sessionId={session.id} isReady={session.status === "ready"} />
+            ) : (
+              <p className="text-sm text-zinc-500">オフライン入力には動画がありません。</p>
+            )}
+          </div>
+          {session.status === "uploaded" || session.status === "failed" ? (
+            <button
+              type="button"
+              onClick={handleProcess}
+              disabled={isProcessing}
+              className="mt-4 inline-flex items-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-zinc-800 hover:bg-zinc-50 disabled:opacity-50"
+            >
+              <RotateCw size={18} />
+              タイムラプス生成
+            </button>
+          ) : null}
+          {session.errorMessage ? (
+            <p className="mt-3 text-sm text-red-700">{session.errorMessage}</p>
+          ) : null}
+        </section>
+
+        {session.type === "recorded" && session.timelapsePath ? (
+          <section className="rounded-lg border border-zinc-200 bg-white p-5">
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <h2 className="text-xl font-semibold">Gemini集中度分析</h2>
+                <p className="mt-2 text-sm text-zinc-500">
+                  分析は自動では実行されません。ボタンを押したときだけVertex AIを使います。
+                </p>
+              </div>
+              <AnalyzeButton session={session} onAnalyzed={setSession} />
+            </div>
+            <div className="mt-5">
+              <AnalysisResultCard
+                status={session.analysisStatus}
+                result={session.analysisResult}
+                errorMessage={session.analysisErrorMessage}
+              />
+            </div>
+          </section>
+        ) : null}
+
+        <section className="grid gap-4 md:grid-cols-2">
+          <div className="rounded-lg border border-zinc-200 bg-white p-5">
+            <h2 className="text-xl font-semibold">メモ</h2>
+            <p className="mt-3 whitespace-pre-wrap text-zinc-700">
+              {session.reflectionNote ?? "-"}
+            </p>
+          </div>
+          <div className="rounded-lg border border-zinc-200 bg-white p-5">
+            <h2 className="text-xl font-semibold">休憩履歴</h2>
+            <div className="mt-3 space-y-2">
+              {session.breakLogs.length > 0 ? (
+                session.breakLogs.map((breakLog, index) => (
+                  <div key={`${breakLog.startedAt}-${index}`} className="text-sm text-zinc-700">
+                    {formatShortDate(breakLog.startedAt)} /{" "}
+                    {breakLog.durationSec === null
+                      ? "進行中"
+                      : formatDuration(breakLog.durationSec)}
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-zinc-500">休憩履歴はありません。</p>
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+------------------------------------------------------------
+src/components/VideoPlayer.tsx
+------------------------------------------------------------
+"use client";
+
+import { useEffect, useState } from "react";
+
+type VideoPlayerProps = {
+  sessionId: string;
+  isReady: boolean;
+};
+
+export function VideoPlayer({ sessionId, isReady }: VideoPlayerProps) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isReady) {
+      return;
+    }
+
+    let cancelled = false;
+    async function loadUrl() {
+      const response = await fetch(`/api/sessions/${sessionId}/video-url`);
+      if (!response.ok) {
+        setError("動画URLを取得できませんでした。");
+        return;
+      }
+      const body = (await response.json()) as { url: string };
+      if (!cancelled) {
+        setUrl(body.url);
+      }
+    }
+
+    void loadUrl();
+    return () => {
+      cancelled = true;
+    };
+  }, [isReady, sessionId]);
+
+  if (!isReady) {
+    return <p className="text-sm text-zinc-500">タイムラプス動画はまだ準備中です。</p>;
+  }
+
+  if (error) {
+    return <p className="text-sm text-red-700">{error}</p>;
+  }
+
+  if (!url) {
+    return <p className="text-sm text-zinc-500">動画URLを取得中...</p>;
+  }
+
+  return <video src={url} controls className="aspect-video w-full rounded-lg bg-black" />;
+}
+
+------------------------------------------------------------
+src/components/SessionCard.tsx
+------------------------------------------------------------
+import Link from "next/link";
+import { SessionThumbnail } from "@/components/SessionThumbnail";
+import type { JsonStudySession } from "@/lib/sessions/types";
+import { formatDuration, formatShortDate } from "@/lib/time/format";
+
+type SessionCardProps = {
+  session: JsonStudySession;
+};
+
+export function SessionCard({ session }: SessionCardProps) {
+  return (
+    <article className="overflow-hidden rounded-lg border border-zinc-200 bg-white transition hover:border-zinc-400">
+      <Link href={`/sessions/${session.id}`} className="block">
+        {session.type === "recorded" ? <SessionThumbnail session={session} /> : null}
+        <div className="p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm text-zinc-500">{formatShortDate(session.startedAt)}</p>
+              <h3 className="mt-1 font-semibold text-zinc-950">
+                {session.studyContent ?? "録画セッション"}
+              </h3>
+            </div>
+            <span className="rounded-full bg-zinc-100 px-2 py-1 text-xs text-zinc-700">
+              {session.type === "offline" ? "オフライン入力" : session.status}
+            </span>
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-2 text-sm">
+            <div>
+              <p className="text-zinc-500">実勉強</p>
+              <p className="font-medium">{formatDuration(session.actualStudySec)}</p>
+            </div>
+            <div>
+              <p className="text-zinc-500">休憩</p>
+              <p className="font-medium">{formatDuration(session.totalBreakSec)}</p>
+            </div>
+            <div>
+              <p className="text-zinc-500">品質</p>
+              <p className="font-medium">{session.quality ?? "-"}</p>
+            </div>
+          </div>
+        </div>
+      </Link>
+    </article>
+  );
+}
+
+============================================================
+4. FirestoreのSession型定義・操作ファイル
+============================================================
+
+------------------------------------------------------------
+src/lib/sessions/types.ts
+------------------------------------------------------------
+import type { Timestamp } from "@google-cloud/firestore";
+
+export type SessionType = "recorded" | "offline";
+export type SessionStatus =
+  | "recording"
+  | "paused"
+  | "interrupted"
+  | "uploaded"
+  | "processing"
+  | "ready"
+  | "failed";
+export type UploadStatus =
+  | "idle"
+  | "uploading"
+  | "offline_pending"
+  | "uploaded"
+  | "failed";
+export type CleanupStatus = "not_started" | "deleting" | "done" | "failed";
+export type InterruptionReason =
+  | "network_offline"
+  | "tab_closed"
+  | "browser_crash"
+  | "manual_pause"
+  | "unknown";
+export type AnalysisStatus = "none" | "pending" | "processing" | "done" | "failed";
+export type TimelapseSpeed = 30 | 60 | 120;
+export type StudyQuality = 1 | 2 | 3 | 4 | 5;
+export type FocusLabel = "かなり低い" | "低い" | "普通" | "高い" | "とても高い";
+
+export type SessionChunk = {
+  segmentIndex: number;
+  index: number;
+  objectPath: string;
+  sizeBytes: number;
+  uploadedAt: Timestamp;
+  deletedAt: Timestamp | null;
+};
+
+export type BreakLog = {
+  startedAt: Timestamp;
+  endedAt: Timestamp | null;
+  durationSec: number | null;
+};
+
+export type RecordingSegment = {
+  segmentIndex: number;
+  startedAt: Timestamp;
+  endedAt: Timestamp | null;
+  reasonEnded: InterruptionReason | "finished" | null;
+};
+
+export type AnalysisResult = {
+  focusScore: number;
+  focusLabel: FocusLabel;
+  studyDetected: boolean;
+  estimatedAbsenceMinutes: number;
+  estimatedPhoneUseMinutes: number;
+  estimatedWritingReadingMinutes: number;
+  summary: string;
+  evidence: string[];
+  uncertainty: string;
+  advice: string;
+};
+
+export type StudySession = {
+  id: string;
+  type: SessionType;
+  targetStudyMinutes: number | null;
+  targetStudySec: number | null;
+  actualStudySec: number;
+  totalElapsedSec: number | null;
+  totalBreakSec: number;
+  achievementRate: number | null;
+  speed: TimelapseSpeed | null;
+  status: SessionStatus;
+  uploadStatus: UploadStatus;
+  cleanupStatus: CleanupStatus;
+  chunksDeletedAt: Timestamp | null;
+  chunksDeletedCount: number;
+  chunksStorageBytes: number;
+  cleanupErrorMessage: string | null;
+  resumeToken: string | null;
+  resumable: boolean;
+  lastHeartbeatAt: Timestamp | null;
+  interruptedAt: Timestamp | null;
+  interruptionReason: InterruptionReason | null;
+  recordingSegments: RecordingSegment[];
+  startedAt: Timestamp;
+  endedAt: Timestamp | null;
+  chunkCount: number;
+  chunks: SessionChunk[];
+  breakLogs: BreakLog[];
+  studyContent: string | null;
+  quality: StudyQuality | null;
+  reflectionNote: string | null;
+  timelapsePath: string | null;
+  timelapseSizeBytes: number | null;
+  thumbnailPath: string | null;
+  errorMessage: string | null;
+  analysisStatus: AnalysisStatus;
+  analysisRequestedAt: Timestamp | null;
+  analysisStartedAt: Timestamp | null;
+  analysisFinishedAt: Timestamp | null;
+  analysisModel: string | null;
+  analysisErrorMessage: string | null;
+  analysisResult: AnalysisResult | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+};
+
+export type JsonSessionChunk = Omit<SessionChunk, "uploadedAt" | "deletedAt"> & {
+  uploadedAt: string;
+  deletedAt: string | null;
+};
+
+export type JsonBreakLog = Omit<BreakLog, "startedAt" | "endedAt"> & {
+  startedAt: string;
+  endedAt: string | null;
+};
+
+export type JsonRecordingSegment = Omit<RecordingSegment, "startedAt" | "endedAt"> & {
+  startedAt: string;
+  endedAt: string | null;
+};
+
+export type JsonStudySession = Omit<
+  StudySession,
+  | "startedAt"
+  | "endedAt"
+  | "createdAt"
+  | "updatedAt"
+  | "chunks"
+  | "breakLogs"
+  | "recordingSegments"
+  | "chunksDeletedAt"
+  | "lastHeartbeatAt"
+  | "interruptedAt"
+  | "analysisRequestedAt"
+  | "analysisStartedAt"
+  | "analysisFinishedAt"
+> & {
+  startedAt: string;
+  endedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  chunks: JsonSessionChunk[];
+  breakLogs: JsonBreakLog[];
+  recordingSegments: JsonRecordingSegment[];
+  chunksDeletedAt: string | null;
+  lastHeartbeatAt: string | null;
+  interruptedAt: string | null;
+  analysisRequestedAt: string | null;
+  analysisStartedAt: string | null;
+  analysisFinishedAt: string | null;
+};
+
+export type DashboardStats = {
+  todayStudySec: number;
+  weekStudySec: number;
+  targetWeeklyStudyMinutes: number;
+  weeklyAchievementRate: number;
+  totalStudySec: number;
+  totalBreakSec: number;
+  totalSessions: number;
+  averageQuality: number | null;
+};
+
+------------------------------------------------------------
+src/lib/sessions/firestore.ts
+------------------------------------------------------------
+import { randomUUID } from "node:crypto";
+import { FieldValue, Timestamp } from "@google-cloud/firestore";
+import { getFirestoreDb } from "@/lib/firebase/admin";
+import type {
+  AnalysisResult,
+  AnalysisStatus,
+  BreakLog,
+  CleanupStatus,
+  InterruptionReason,
+  JsonBreakLog,
+  JsonRecordingSegment,
+  JsonSessionChunk,
+  JsonStudySession,
+  RecordingSegment,
+  StudyQuality,
+  StudySession,
+  TimelapseSpeed,
+  UploadStatus,
+} from "@/lib/sessions/types";
+
+const SESSIONS_COLLECTION = "sessions";
+const SETTINGS_COLLECTION = "settings";
+const WEEKLY_GOAL_DOC = "weeklyGoal";
+
+export function getAutoTimelapseSpeed(actualStudySec: number): TimelapseSpeed {
+  if (actualStudySec < 45 * 60) {
+    return 30;
+  }
+  if (actualStudySec < 120 * 60) {
+    return 60;
+  }
+
+  return 120;
+}
+
+function sessionCollection() {
+  return getFirestoreDb().collection(SESSIONS_COLLECTION);
+}
+
+function timestampToIso(value: Timestamp | null): string | null {
+  return value ? value.toDate().toISOString() : null;
+}
+
+function normalizeChunk(
+  chunk: Partial<StudySession["chunks"][number]>,
+): StudySession["chunks"][number] {
+  return {
+    segmentIndex: typeof chunk.segmentIndex === "number" ? chunk.segmentIndex : 0,
+    index: typeof chunk.index === "number" ? chunk.index : 0,
+    objectPath: typeof chunk.objectPath === "string" ? chunk.objectPath : "",
+    sizeBytes: typeof chunk.sizeBytes === "number" ? chunk.sizeBytes : 0,
+    uploadedAt: chunk.uploadedAt instanceof Timestamp ? chunk.uploadedAt : Timestamp.now(),
+    deletedAt: chunk.deletedAt instanceof Timestamp ? chunk.deletedAt : null,
+  };
+}
+
+function normalizeRecordingSegments(
+  value: unknown,
+  startedAt: Timestamp,
+): RecordingSegment[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    return [
+      {
+        segmentIndex: 0,
+        startedAt,
+        endedAt: null,
+        reasonEnded: null,
+      },
+    ];
+  }
+
+  return value.map((item, index) => {
+    const segment = item as Partial<RecordingSegment>;
+    return {
+      segmentIndex: typeof segment.segmentIndex === "number" ? segment.segmentIndex : index,
+      startedAt: segment.startedAt instanceof Timestamp ? segment.startedAt : startedAt,
+      endedAt: segment.endedAt instanceof Timestamp ? segment.endedAt : null,
+      reasonEnded: segment.reasonEnded ?? null,
+    };
+  });
+}
+
+export function toJsonSession(session: StudySession): JsonStudySession {
+  const chunks: JsonSessionChunk[] = session.chunks.map((chunk) => ({
+    ...chunk,
+    uploadedAt: chunk.uploadedAt.toDate().toISOString(),
+    deletedAt: timestampToIso(chunk.deletedAt),
+  }));
+  const breakLogs: JsonBreakLog[] = session.breakLogs.map((breakLog) => ({
+    ...breakLog,
+    startedAt: breakLog.startedAt.toDate().toISOString(),
+    endedAt: timestampToIso(breakLog.endedAt),
+  }));
+  const recordingSegments: JsonRecordingSegment[] = session.recordingSegments.map(
+    (segment) => ({
+      ...segment,
+      startedAt: segment.startedAt.toDate().toISOString(),
+      endedAt: timestampToIso(segment.endedAt),
+    }),
+  );
+
+  return {
+    ...session,
+    startedAt: session.startedAt.toDate().toISOString(),
+    endedAt: timestampToIso(session.endedAt),
+    createdAt: session.createdAt.toDate().toISOString(),
+    updatedAt: session.updatedAt.toDate().toISOString(),
+    chunks,
+    breakLogs,
+    recordingSegments,
+    chunksDeletedAt: timestampToIso(session.chunksDeletedAt),
+    lastHeartbeatAt: timestampToIso(session.lastHeartbeatAt),
+    interruptedAt: timestampToIso(session.interruptedAt),
+    analysisRequestedAt: timestampToIso(session.analysisRequestedAt),
+    analysisStartedAt: timestampToIso(session.analysisStartedAt),
+    analysisFinishedAt: timestampToIso(session.analysisFinishedAt),
+  };
+}
+
+function snapshotToSession(
+  snapshot: FirebaseFirestore.QueryDocumentSnapshot | FirebaseFirestore.DocumentSnapshot,
+): StudySession | null {
+  const data = snapshot.data() as Partial<Omit<StudySession, "id">> | undefined;
+  if (!data) {
+    return null;
+  }
+  const startedAt = data.startedAt instanceof Timestamp ? data.startedAt : Timestamp.now();
+  const now = Timestamp.now();
+
+  return {
+    id: snapshot.id,
+    type: data.type ?? "recorded",
+    targetStudyMinutes: data.targetStudyMinutes ?? null,
+    targetStudySec: data.targetStudySec ?? null,
+    actualStudySec: data.actualStudySec ?? 0,
+    totalElapsedSec: data.totalElapsedSec ?? null,
+    totalBreakSec: data.totalBreakSec ?? 0,
+    achievementRate: data.achievementRate ?? null,
+    speed: data.speed ?? null,
+    status: data.status ?? "ready",
+    uploadStatus: data.uploadStatus ?? "uploaded",
+    cleanupStatus: data.cleanupStatus ?? "not_started",
+    chunksDeletedAt: data.chunksDeletedAt ?? null,
+    chunksDeletedCount: data.chunksDeletedCount ?? 0,
+    chunksStorageBytes: data.chunksStorageBytes ?? 0,
+    cleanupErrorMessage: data.cleanupErrorMessage ?? null,
+    resumeToken: data.resumeToken ?? null,
+    resumable: data.resumable ?? data.status === "recording",
+    lastHeartbeatAt: data.lastHeartbeatAt ?? null,
+    interruptedAt: data.interruptedAt ?? null,
+    interruptionReason: data.interruptionReason ?? null,
+    recordingSegments: normalizeRecordingSegments(data.recordingSegments, startedAt),
+    startedAt,
+    endedAt: data.endedAt ?? null,
+    chunkCount: data.chunkCount ?? data.chunks?.length ?? 0,
+    chunks: (data.chunks ?? []).map((chunk) => normalizeChunk(chunk)),
+    breakLogs: data.breakLogs ?? [],
+    studyContent: data.studyContent ?? null,
+    quality: data.quality ?? null,
+    reflectionNote: data.reflectionNote ?? null,
+    timelapsePath: data.timelapsePath ?? null,
+    timelapseSizeBytes: data.timelapseSizeBytes ?? null,
+    thumbnailPath: data.thumbnailPath ?? null,
+    errorMessage: data.errorMessage ?? null,
+    analysisStatus: data.analysisStatus ?? "none",
+    analysisRequestedAt: data.analysisRequestedAt ?? null,
+    analysisStartedAt: data.analysisStartedAt ?? null,
+    analysisFinishedAt: data.analysisFinishedAt ?? null,
+    analysisModel: data.analysisModel ?? null,
+    analysisErrorMessage: data.analysisErrorMessage ?? null,
+    analysisResult: data.analysisResult ?? null,
+    createdAt: data.createdAt ?? now,
+    updatedAt: data.updatedAt ?? now,
+  };
+}
+
+export async function listSessions(limit = 50): Promise<StudySession[]> {
+  const snapshot = await sessionCollection()
+    .orderBy("startedAt", "desc")
+    .limit(limit)
+    .get();
+
+  return snapshot.docs
+    .map((doc) => snapshotToSession(doc))
+    .filter((session): session is StudySession => session !== null);
+}
+
+export async function listAllSessions(): Promise<StudySession[]> {
+  const snapshot = await sessionCollection().orderBy("startedAt", "desc").get();
+
+  return snapshot.docs
+    .map((doc) => snapshotToSession(doc))
+    .filter((session): session is StudySession => session !== null);
+}
+
+export async function getSession(id: string): Promise<StudySession | null> {
+  const snapshot = await sessionCollection().doc(id).get();
+  return snapshotToSession(snapshot);
+}
+
+export async function createRecordedSession(
+  targetStudyMinutes: number,
+  speed: TimelapseSpeed,
+): Promise<StudySession> {
+  const doc = sessionCollection().doc();
+  const now = Timestamp.now();
+  const session: StudySession = {
+    id: doc.id,
+    type: "recorded",
+    targetStudyMinutes,
+    targetStudySec: Math.round(targetStudyMinutes * 60),
+    actualStudySec: 0,
+    totalElapsedSec: null,
+    totalBreakSec: 0,
+    achievementRate: null,
+    speed,
+    status: "recording",
+    uploadStatus: "idle",
+    cleanupStatus: "not_started",
+    chunksDeletedAt: null,
+    chunksDeletedCount: 0,
+    chunksStorageBytes: 0,
+    cleanupErrorMessage: null,
+    resumeToken: randomUUID(),
+    resumable: true,
+    lastHeartbeatAt: now,
+    interruptedAt: null,
+    interruptionReason: null,
+    recordingSegments: [
+      {
+        segmentIndex: 0,
+        startedAt: now,
+        endedAt: null,
+        reasonEnded: null,
+      },
+    ],
+    startedAt: now,
+    endedAt: null,
+    chunkCount: 0,
+    chunks: [],
+    breakLogs: [],
+    studyContent: null,
+    quality: null,
+    reflectionNote: null,
+    timelapsePath: null,
+    timelapseSizeBytes: null,
+    thumbnailPath: null,
+    errorMessage: null,
+    analysisStatus: "none",
+    analysisRequestedAt: null,
+    analysisStartedAt: null,
+    analysisFinishedAt: null,
+    analysisModel: null,
+    analysisErrorMessage: null,
+    analysisResult: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await doc.set(session);
+  return session;
+}
+
+export async function createOfflineSession(input: {
+  studyDate: string;
+  studyMinutes: number;
+  breakMinutes: number;
+  studyContent: string;
+  quality: StudyQuality;
+  reflectionNote: string | null;
+}): Promise<StudySession> {
+  const doc = sessionCollection().doc();
+  const now = Timestamp.now();
+  const startedAt = Timestamp.fromDate(new Date(`${input.studyDate}T00:00:00+09:00`));
+  const actualStudySec = Math.round(input.studyMinutes * 60);
+  const totalBreakSec = Math.round(input.breakMinutes * 60);
+  const session: StudySession = {
+    id: doc.id,
+    type: "offline",
+    targetStudyMinutes: null,
+    targetStudySec: null,
+    actualStudySec,
+    totalElapsedSec: actualStudySec + totalBreakSec,
+    totalBreakSec,
+    achievementRate: null,
+    speed: null,
+    status: "ready",
+    uploadStatus: "uploaded",
+    cleanupStatus: "done",
+    chunksDeletedAt: null,
+    chunksDeletedCount: 0,
+    chunksStorageBytes: 0,
+    cleanupErrorMessage: null,
+    resumeToken: null,
+    resumable: false,
+    lastHeartbeatAt: null,
+    interruptedAt: null,
+    interruptionReason: null,
+    recordingSegments: [],
+    startedAt,
+    endedAt: startedAt,
+    chunkCount: 0,
+    chunks: [],
+    breakLogs: [],
+    studyContent: input.studyContent,
+    quality: input.quality,
+    reflectionNote: input.reflectionNote,
+    timelapsePath: null,
+    timelapseSizeBytes: null,
+    thumbnailPath: null,
+    errorMessage: null,
+    analysisStatus: "none",
+    analysisRequestedAt: null,
+    analysisStartedAt: null,
+    analysisFinishedAt: null,
+    analysisModel: null,
+    analysisErrorMessage: null,
+    analysisResult: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await doc.set(session);
+  return session;
+}
+
+export async function registerChunk(input: {
+  sessionId: string;
+  segmentIndex: number;
+  index: number;
+  objectPath: string;
+  sizeBytes: number;
+}): Promise<void> {
+  const ref = sessionCollection().doc(input.sessionId);
+  await getFirestoreDb().runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(ref);
+    const session = snapshotToSession(snapshot);
+    if (!session) {
+      throw new Error("Session not found.");
+    }
+
+------------------------------------------------------------
+src/lib/sessions/stats.ts
+------------------------------------------------------------
+import type { DashboardStats, StudySession } from "@/lib/sessions/types";
+import { getWeeklyGoalMinutes, listAllSessions } from "@/lib/sessions/firestore";
+
+function startOfToday(): Date {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+function startOfWeekMonday(): Date {
+  const today = startOfToday();
+  const day = today.getDay();
+  const distanceFromMonday = day === 0 ? 6 : day - 1;
+  today.setDate(today.getDate() - distanceFromMonday);
+  return today;
+}
+
+function isAfterOrSame(session: StudySession, boundary: Date): boolean {
+  return session.startedAt.toDate().getTime() >= boundary.getTime();
+}
+
+export async function getDashboardStats(): Promise<DashboardStats> {
+  const [sessions, targetWeeklyStudyMinutes] = await Promise.all([
+    listAllSessions(),
+    getWeeklyGoalMinutes(),
+  ]);
+  const today = startOfToday();
+  const week = startOfWeekMonday();
+  const todayStudySec = sessions
+    .filter((session) => isAfterOrSame(session, today))
+    .reduce((sum, session) => sum + session.actualStudySec, 0);
+  const weekStudySec = sessions
+    .filter((session) => isAfterOrSame(session, week))
+    .reduce((sum, session) => sum + session.actualStudySec, 0);
+  const totalStudySec = sessions.reduce((sum, session) => sum + session.actualStudySec, 0);
+  const totalBreakSec = sessions.reduce((sum, session) => sum + session.totalBreakSec, 0);
+  const qualitySessions = sessions.filter((session) => session.quality !== null);
+  const averageQuality =
+    qualitySessions.length > 0
+      ? qualitySessions.reduce((sum, session) => sum + (session.quality ?? 0), 0) /
+        qualitySessions.length
+      : null;
+  const weeklyAchievementRate =
+    targetWeeklyStudyMinutes > 0 ? (weekStudySec / (targetWeeklyStudyMinutes * 60)) * 100 : 0;
+
+  return {
+    todayStudySec,
+    weekStudySec,
+    targetWeeklyStudyMinutes,
+    weeklyAchievementRate,
+    totalStudySec,
+    totalBreakSec,
+    totalSessions: sessions.length,
+    averageQuality,
+  };
+}
+
+------------------------------------------------------------
+src/lib/firebase/admin.ts
+------------------------------------------------------------
+import { Firestore } from "@google-cloud/firestore";
+
+let firestore: Firestore | null = null;
+
+export function getFirestoreDb(): Firestore {
+  if (!firestore) {
+    firestore = new Firestore({
+      projectId: process.env.GCP_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT,
+    });
+  }
+
+  return firestore;
+}
+
+------------------------------------------------------------
+src/lib/gcs.ts
+------------------------------------------------------------
+NOT FOUND: src/lib/gcs.ts
+
+------------------------------------------------------------
+src/lib/storage.ts
+------------------------------------------------------------
+NOT FOUND: src/lib/storage.ts
+
+============================================================
+5. API routes一覧
+============================================================
+src/app/api/offline-sessions/route.ts
+src/app/api/sessions/[id]/analyze/route.ts
+src/app/api/sessions/[id]/break/end/route.ts
+src/app/api/sessions/[id]/break/start/route.ts
+src/app/api/sessions/[id]/chunk-complete/route.ts
+src/app/api/sessions/[id]/finish/route.ts
+src/app/api/sessions/[id]/heartbeat/route.ts
+src/app/api/sessions/[id]/interrupt/route.ts
+src/app/api/sessions/[id]/process/route.ts
+src/app/api/sessions/[id]/resume/route.ts
+src/app/api/sessions/[id]/route.ts
+src/app/api/sessions/[id]/thumbnail-url/route.ts
+src/app/api/sessions/[id]/upload-pending/route.ts
+src/app/api/sessions/[id]/upload-url/route.ts
+src/app/api/sessions/[id]/video-url/route.ts
+src/app/api/sessions/resumable/route.ts
+src/app/api/sessions/route.ts
+src/app/api/sessions/stats/route.ts
+src/app/api/settings/weekly-goal/route.ts
+
+============================================================
+6. package.json
+============================================================
+{
+  "name": "study-log",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^8.6.0",
+    "@google-cloud/storage": "^7.19.0",
+    "@google-cloud/vertexai": "^1.12.0",
+    "google-auth-library": "^10.6.2",
+    "lucide-react": "^1.17.0",
+    "next": "16.2.6",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
+
+============================================================
+7. 環境変数例
+============================================================
+GCP_PROJECT_ID=vla-test1
+GOOGLE_CLOUD_PROJECT=vla-test1
+GCS_BUCKET_NAME=vla-test1-study-timelapse
+NEXT_PUBLIC_APP_NAME=Study Timelapse
+VERTEX_LOCATION=us-central1
+VERTEX_MODEL=gemini-2.5-pro
+ANALYSIS_MAX_OUTPUT_TOKENS=2048
+
+============================================================
+8. README / デプロイ関連
+============================================================
+
+------------------------------------------------------------
+README.md
+------------------------------------------------------------
+# Study Timelapse
+
+個人用の勉強タイムラプス記録Webアプリです。ログイン機能はありません。勉強開始時に目標時間を入力し、ブラウザのMediaRecorderで録画し、chunkを署名付きURLでprivate GCS bucketへ直接PUTします。終了後に実勉強時間からタイムラプス速度を自動決定し、Cloud Run内のFFmpegでタイムラプスMP4を生成します。
+
+タイムラプス作成後は元動画chunkをGCSから削除し、Firestoreにはchunkメタデータだけ残します。ネット切断時はchunkをIndexedDBへ一時保存し、オンライン復帰後に再送します。タブを閉じた場合、録画自体は止まりますが、セッション情報は残り、次回起動時に新しいrecording segmentとして再開できます。Gemini分析は自動実行されず、ユーザーが「分析実行」ボタンを押したときだけVertex AI Gemini 2.5 Proへ動画を送ります。
+
+## 機能一覧
+
+- ダッシュボード: 今日、今週、週間目標、達成率、総勉強時間、総休憩時間、総セッション数、平均品質、最近のセッションを表示
+- 週間目標設定: `settings/weeklyGoal` に目標分数を保存
+- 録画セッション: カメラ録画、30秒chunk upload、IndexedDB一時保存、オンライン復帰再送、休憩開始/終了、停止、終了後入力、実勉強時間に応じたタイムラプス生成
+- セッション再開: localStorageにactive sessionを保存し、タブ再オープン時に「前回のセッションを再開しますか？」を表示
+- セッション詳細: 勉強時間、休憩履歴、品質、メモ、private GCS動画の短時間signed read URL再生、元動画chunk削除状況、Gemini分析結果
+- Gemini分析: タイムラプス完成後、手動ボタンで集中度、離席、スマホ操作、読み書き推定を分析
+- オフライン入力: 動画なしの勉強時間をあとから追加
+
+## 使用技術
+
+- Next.js App Router / TypeScript / Tailwind CSS
+- Firestore
+- Google Cloud Storage
+- Cloud Run
+- FFmpeg
+- Vertex AI Gemini 2.5 Pro
+- Node.js 20以上
+
+## GCPプロジェクト情報
+
+- Project ID: `vla-test1`
+- Project number: `116342725707`
+- Region: `asia-northeast1`
+- Cloud Run service: `study-timelapse`
+- GCS bucket: `vla-test1-study-timelapse`
+- Service Account: `study-timelapse-sa@vla-test1.iam.gserviceaccount.com`
+
+## 必要API
+
+`run.googleapis.com`, `cloudbuild.googleapis.com`, `artifactregistry.googleapis.com`, `storage.googleapis.com`, `firestore.googleapis.com`, `iamcredentials.googleapis.com`, `billingbudgets.googleapis.com`, `cloudbilling.googleapis.com`, `aiplatform.googleapis.com`
+
+## Firestore設計
+
+`sessions/{sessionId}` は録画/オフライン共通のセッションを保存します。主なフィールドは `type`, `targetStudyMinutes`, `actualStudySec`, `totalBreakSec`, `achievementRate`, `speed`, `status`, `uploadStatus`, `cleanupStatus`, `chunks`, `recordingSegments`, `breakLogs`, `studyContent`, `quality`, `reflectionNote`, `timelapsePath`, `timelapseSizeBytes`, `analysisStatus`, `analysisResult` です。
+
+`status`: `recording`, `paused`, `interrupted`, `uploaded`, `processing`, `ready`, `failed`
+
+`uploadStatus`: `idle`, `uploading`, `offline_pending`, `uploaded`, `failed`
+
+`cleanupStatus`: `not_started`, `deleting`, `done`, `failed`
+
+`analysisStatus`: `none`, `pending`, `processing`, `done`, `failed`
+
+新しいchunkメタデータ:
+
+```json
+{
+  "segmentIndex": 0,
+  "index": 0,
+  "objectPath": "users/local/sessions/{sessionId}/segments/0/chunks/0.webm",
+  "sizeBytes": 123456,
+  "uploadedAt": "Timestamp",
+  "deletedAt": null
+}
+```
+
+既存データに新フィールドがない場合、API側でデフォルト値を補完します。古いchunkに `segmentIndex` がない場合は `0` として扱います。
+
+`settings/weeklyGoal`:
+
+```json
+{
+  "targetWeeklyStudyMinutes": 600,
+  "updatedAt": "Timestamp"
+}
+```
+
+タイムラプス速度は終了時の実勉強時間で自動決定します。
+
+- 45分未満: `30x`
+- 45分以上2時間未満: `60x`
+- 2時間以上: `120x`
+
+## GCS設計
+
+- chunks: `users/local/sessions/{sessionId}/segments/{segmentIndex}/chunks/{chunkIndex}.webm`
+- legacy chunks: `users/local/sessions/{sessionId}/chunks/{index}.webm` もタイムラプス生成時に読み取れます
+- timelapse: `users/local/sessions/{sessionId}/timelapse.mp4`
+- thumbnail: `users/local/sessions/{sessionId}/thumbnail.jpg`
+- bucketはprivate、Uniform bucket-level accessを有効化
+- MVPのCORSは `origin: ["*"]`。本番ではCloud Run URLだけに絞ってください。
+- タイムラプスMP4のGCSアップロード成功後、元動画chunkはGCSから削除されます
+- Firestoreにはchunkメタデータ、削除件数、削減容量、削除エラーだけを残します
+
+## 再開とオフライン保存
+
+- localStorageにactive session ID、segmentIndex、chunkIndex、目標時間、休憩状態を保存します
+- IndexedDBに未アップロードchunk Blobを保存します
+- chunkはGCSへPUTする前に必ずIndexedDBへ保存します
+- オフライン時は `uploadStatus=offline_pending` として、オンライン復帰イベントで順番に再送します
+- タブを閉じた場合、録画自体は止まります。閉じる直前の最後のBlobは失われる可能性があります
+- chunk間隔は30秒なので、最悪でも失われる動画を30秒程度に抑える設計です
+- 再開後は新しい `recordingSegments[]` として記録され、閉じていた間の映像は存在しません
+
+## Gemini分析
+
+- 分析は自動実行しません
+- `status=ready` かつ `timelapsePath` がある場合だけ、画面に「Geminiで集中度分析」ボタンを表示します
+- ボタン押下時のみ `/api/sessions/{id}/analyze` がVertex AI Gemini 2.5 Proを呼びます
+- 分析結果は `analysisResult` に保存されます
+- Gemini 2.5 Pro分析は費用が発生します。長時間動画や高頻度利用では費用が増えます
+- サービスアカウントJSONキーは使いません。Cloud RunのApplication Default Credentialsを使います
+
+## ローカル起動
+
+```bash
+npm install
+cp .env.example .env.local
+npm run dev
+```
+
+検証:
+
+```bash
+npm run lint
+npm run typecheck
+npm run build
+```
+
+## Cloud Runデプロイ手順
+
+```bash
+export PROJECT_ID="vla-test1"
+export PROJECT_NUMBER="116342725707"
+export REGION="asia-northeast1"
+export SERVICE_NAME="study-timelapse"
+export BUCKET_NAME="vla-test1-study-timelapse"
+export SA_NAME="study-timelapse-sa"
+export SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+export BUDGET_AMOUNT="1000"
+
+gcloud config set project "$PROJECT_ID"
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com storage.googleapis.com firestore.googleapis.com iamcredentials.googleapis.com billingbudgets.googleapis.com cloudbilling.googleapis.com
+gcloud services enable aiplatform.googleapis.com --project="$PROJECT_ID"
+gcloud firestore databases list
+gcloud firestore databases create --database="(default)" --location="asia-northeast1" --edition="standard" --type="firestore-native"
+gcloud storage buckets create "gs://${BUCKET_NAME}" --location="$REGION" --uniform-bucket-level-access
+gcloud storage buckets update "gs://${BUCKET_NAME}" --cors-file=cors.json
+gcloud iam service-accounts create "$SA_NAME" --display-name="Study Timelapse Cloud Run Service Account"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SA_EMAIL}" --role="roles/datastore.user"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectAdmin"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SA_EMAIL}" --role="roles/iam.serviceAccountTokenCreator"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${SA_EMAIL}" --role="roles/aiplatform.user"
+
+gcloud run deploy "$SERVICE_NAME" --source . --region "$REGION" --service-account="$SA_EMAIL" --allow-unauthenticated --memory=2Gi --cpu=2 --timeout=3600 --min-instances=0 --max-instances=3 --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GCS_BUCKET_NAME=$BUCKET_NAME,NEXT_PUBLIC_APP_NAME=Study Timelapse,VERTEX_LOCATION=us-central1,VERTEX_MODEL=gemini-2.5-pro,ANALYSIS_MAX_OUTPUT_TOKENS=2048"
+```
+
+既存Cloud Run serviceの環境変数だけ更新する例:
+
+```bash
+gcloud run services update study-timelapse --region=asia-northeast1 --project=vla-test1 --set-env-vars="VERTEX_LOCATION=us-central1,VERTEX_MODEL=gemini-2.5-pro,ANALYSIS_MAX_OUTPUT_TOKENS=2048"
+```
+
+## バジェット作成
+
+Google Cloud Budgetは通知用で、支出を自動停止するものではありません。`BUDGET_AMOUNT` は請求先アカウントの通貨で解釈されます。
+
+```bash
+export BILLING_ACCOUNT_ID="$(gcloud billing projects describe "$PROJECT_ID" --format='value(billingAccountName)' | sed 's#billingAccounts/##')"
+gcloud billing budgets list --billing-account="$BILLING_ACCOUNT_ID"
+gcloud billing budgets create --billing-account="$BILLING_ACCOUNT_ID" --display-name="vla-test1 monthly budget" --budget-amount="$BUDGET_AMOUNT" --filter-projects="projects/$PROJECT_ID" --threshold-rule=percent=0.50 --threshold-rule=percent=0.80 --threshold-rule=percent=1.00 --threshold-rule=percent=1.00,basis=forecasted-spend --calendar-period=month
+```
+
+## 動作確認
+
+- ダッシュボードが表示される
+- 週間目標を保存できる
+- オフライン勉強時間を保存できる
+- 勉強セッションを開始し、カメラ録画できる
+- 休憩開始/終了、停止、終了後入力ができる
+- GCSにchunkが保存される
+- FFmpegでタイムラプスが生成される
+- タイムラプス作成後、GCS上の元動画chunkが削除され、`cleanupStatus=done` になる
+- 詳細ページで動画再生できる
+- 分析は自動実行されず、分析実行ボタンを押したときだけ `analysisStatus=processing` になる
+- 成功後 `analysisStatus=done` になり、集中度スコアが表示される
+- 録画中にネットを切ると、chunkがIndexedDBに残り、オンライン復帰後に再送される
+- 録画中にタブを閉じて再度開くと、前回セッション再開UIが表示される
+- ダッシュボード統計に反映される
+
+## 既知の制限
+
+- PC Chrome / Edge想定
+- iPhone SafariはMVP対象外
+- 長時間動画はCloud Run service内処理では重くなる可能性があります
+- 本格運用ではタイムラプス処理をCloud Run Jobsへ分離推奨
+- ログインなし、`--allow-unauthenticated` なのでCloud Run URLの共有に注意
+- Cloud RunのURLはログインなしで公開されているため、個人用でもURL管理に注意してください
+- Budgetは通知用であり、支出を自動停止しません
+# study-log-timerapse
+
+------------------------------------------------------------
+DEPLOY.md
+------------------------------------------------------------
+NOT FOUND: DEPLOY.md
+
+------------------------------------------------------------
+deploy.md
+------------------------------------------------------------
+NOT FOUND: deploy.md
+
+------------------------------------------------------------
+docs/deploy.md
+------------------------------------------------------------
+NOT FOUND: docs/deploy.md

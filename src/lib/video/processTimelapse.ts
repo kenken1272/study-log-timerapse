@@ -1,10 +1,17 @@
 import { spawn } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { getBucket } from "@/lib/gcp/storage";
+import {
+  deleteObjects,
+  downloadObjectToFile,
+  uploadFileToObject,
+} from "@/lib/gcp/storage";
 import {
   getSession,
   getAutoTimelapseSpeed,
+  updateSessionCleanupDeleting,
+  updateSessionCleanupDone,
+  updateSessionCleanupFailed,
   updateSessionFailed,
   updateSessionProcessing,
   updateSessionReady,
@@ -50,18 +57,19 @@ export async function processTimelapse(sessionId: string): Promise<string> {
     }
 
     const speed = session.speed ?? getAutoTimelapseSpeed(session.actualStudySec);
-    const bucket = getBucket();
     const workDir = path.join("/tmp", sessionId);
     const chunksDir = path.join(workDir, "chunks");
     await rm(workDir, { recursive: true, force: true });
     await mkdir(chunksDir, { recursive: true });
 
-    const sortedChunks = [...session.chunks].sort((a, b) => a.index - b.index);
+    const sortedChunks = [...session.chunks].sort(
+      (a, b) => a.segmentIndex - b.segmentIndex || a.index - b.index,
+    );
     const localFiles: string[] = [];
 
     for (const chunk of sortedChunks) {
-      const localPath = path.join(chunksDir, `${chunk.index}.webm`);
-      await bucket.file(chunk.objectPath).download({ destination: localPath });
+      const localPath = path.join(chunksDir, `${chunk.segmentIndex}-${chunk.index}.webm`);
+      await downloadObjectToFile(chunk.objectPath, localPath);
       localFiles.push(localPath);
     }
 
@@ -110,17 +118,56 @@ export async function processTimelapse(sessionId: string): Promise<string> {
 
     const timelapsePath = `users/local/sessions/${sessionId}/timelapse.mp4`;
     const thumbnailPath = `users/local/sessions/${sessionId}/thumbnail.jpg`;
-    await bucket.upload(outputPath, {
-      destination: timelapsePath,
-      contentType: "video/mp4",
-      resumable: false,
-    });
-    await bucket.upload(thumbnailLocalPath, {
-      destination: thumbnailPath,
-      contentType: "image/jpeg",
-      resumable: false,
-    });
-    await updateSessionReady(sessionId, timelapsePath, thumbnailPath);
+    const timelapseUpload = await uploadFileToObject(
+      outputPath,
+      timelapsePath,
+      "video/mp4",
+    );
+    await uploadFileToObject(thumbnailLocalPath, thumbnailPath, "image/jpeg");
+    await updateSessionReady(
+      sessionId,
+      timelapsePath,
+      timelapseUpload.sizeBytes,
+      thumbnailPath,
+    );
+
+    try {
+      const chunkObjectPaths = sortedChunks
+        .filter((chunk) => chunk.deletedAt === null)
+        .map((chunk) => chunk.objectPath);
+      const chunksStorageBytes = sortedChunks.reduce(
+        (sum, chunk) => sum + chunk.sizeBytes,
+        0,
+      );
+      if (chunkObjectPaths.length > 0) {
+        await updateSessionCleanupDeleting(sessionId);
+        const deleteResult = await deleteObjects(chunkObjectPaths);
+        if (deleteResult.failed.length > 0) {
+          await updateSessionCleanupFailed(
+            sessionId,
+            deleteResult.failed
+              .map((failure) => `${failure.objectPath}: ${failure.message}`)
+              .join("\n"),
+          );
+        } else {
+          await updateSessionCleanupDone({
+            sessionId,
+            deletedObjectPaths: chunkObjectPaths,
+            chunksStorageBytes,
+          });
+        }
+      } else {
+        await updateSessionCleanupDone({
+          sessionId,
+          deletedObjectPaths: [],
+          chunksStorageBytes,
+        });
+      }
+    } catch (cleanupError) {
+      const cleanupMessage =
+        cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error.";
+      await updateSessionCleanupFailed(sessionId, cleanupMessage);
+    }
     await rm(workDir, { recursive: true, force: true });
 
     return timelapsePath;

@@ -46,6 +46,71 @@ export function getBucket() {
   return getStorageClient().bucket(getBucketName());
 }
 
+export async function downloadObjectToFile(
+  objectPath: string,
+  localPath: string,
+): Promise<void> {
+  await getBucket().file(objectPath).download({ destination: localPath });
+}
+
+export async function uploadFileToObject(
+  localPath: string,
+  objectPath: string,
+  contentType: string,
+): Promise<{ sizeBytes: number }> {
+  const [file] = await getBucket().upload(localPath, {
+    destination: objectPath,
+    contentType,
+    resumable: false,
+  });
+  const [metadata] = await file.getMetadata();
+  const rawSize = metadata.size;
+  const sizeBytes =
+    typeof rawSize === "number"
+      ? rawSize
+      : typeof rawSize === "string"
+        ? Number(rawSize)
+        : 0;
+
+  return { sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : 0 };
+}
+
+export async function deleteObjectIfExists(objectPath: string): Promise<boolean> {
+  const file = getBucket().file(objectPath);
+  const [exists] = await file.exists();
+  if (!exists) {
+    return false;
+  }
+
+  await file.delete({ ignoreNotFound: true });
+  return true;
+}
+
+export async function deleteObjects(
+  objectPaths: string[],
+): Promise<{ deletedCount: number; failed: Array<{ objectPath: string; message: string }> }> {
+  const results = await Promise.all(
+    objectPaths.map(async (objectPath) => {
+      try {
+        const deleted = await deleteObjectIfExists(objectPath);
+        return { objectPath, deleted, message: null };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown delete error.";
+        return { objectPath, deleted: false, message };
+      }
+    }),
+  );
+  const failed = results
+    .filter((result) => result.message !== null)
+    .map((result) => ({
+      objectPath: result.objectPath,
+      message: result.message ?? "Unknown delete error.",
+    }));
+  const deletedCount = results.filter((result) => result.deleted).length;
+
+  return { deletedCount, failed };
+}
+
 export async function deleteSessionObjects(sessionId: string): Promise<void> {
   await getBucket().deleteFiles({
     prefix: `users/local/sessions/${sessionId}/`,
@@ -180,3 +245,6 @@ export async function createSignedReadUrl(objectPath: string): Promise<string> {
     objectPath,
   });
 }
+
+export const getSignedReadUrl = createSignedReadUrl;
+export const getSignedWriteUrl = createSignedUploadUrl;

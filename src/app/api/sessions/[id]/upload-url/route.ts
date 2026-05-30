@@ -13,9 +13,14 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
     const body = await readJsonRecord(request);
-    const index = integerValue(body.index, "index");
+    const segmentIndex =
+      body.segmentIndex === undefined ? 0 : integerValue(body.segmentIndex, "segmentIndex");
+    const chunkIndex =
+      body.chunkIndex === undefined
+        ? integerValue(body.index, "index")
+        : integerValue(body.chunkIndex, "chunkIndex");
     const contentType = requiredString(body.contentType, "contentType", 120);
-    const objectPath = `users/local/sessions/${id}/chunks/${index}.webm`;
+    const objectPath = `users/local/sessions/${id}/segments/${segmentIndex}/chunks/${chunkIndex}.webm`;
     const uploadUrl = await createSignedUploadUrl(objectPath, contentType);
 
     return NextResponse.json({ uploadUrl, objectPath });

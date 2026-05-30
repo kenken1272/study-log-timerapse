@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { BookOpen, Clock, Plus } from "lucide-react";
+import { BadgeJapaneseYen, BookOpen, Clock, Plus } from "lucide-react";
 import { SessionCard } from "@/components/SessionCard";
 import { StatsCards } from "@/components/StatsCards";
 import { WeeklyGoalCard } from "@/components/WeeklyGoalCard";
@@ -73,6 +73,13 @@ export default function DashboardPage() {
             >
               <Clock size={18} />
               オフライン入力
+            </Link>
+            <Link
+              href="/earnings"
+              className="inline-flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-4 py-2 text-amber-900 hover:bg-amber-100"
+            >
+              <BadgeJapaneseYen size={18} />
+              チェック
             </Link>
           </div>
         </header>
