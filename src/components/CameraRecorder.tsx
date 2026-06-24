@@ -24,10 +24,12 @@ import {
 } from "@/lib/client/sessionResume";
 import { fetchWithRetry, friendlyFetchError } from "@/lib/client/fetchWithRetry";
 import { formatDuration, formatShortDate } from "@/lib/time/format";
+import { AuthGate } from "@/components/auth/AuthGate";
 import { QualitySelector } from "@/components/QualitySelector";
 import { RecordingStatusPanel } from "@/components/RecordingStatusPanel";
 import { SmallCameraPreview } from "@/components/SmallCameraPreview";
 import { StudyMinutesControl } from "@/components/StudyMinutesControl";
+import { useAuth } from "@/hooks/use-auth";
 
 const CHUNK_TIMESLICE_MS = 30_000;
 const MIN_CHUNK_DURATION_MS = 1_000;
@@ -46,6 +48,7 @@ type UploadUrlResponse = {
 };
 
 type RecorderPhase = "setup" | "recording" | "review" | "processing";
+type AuthenticatedFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 function preferredMimeType(): string {
   if (typeof MediaRecorder === "undefined") {
@@ -61,8 +64,12 @@ function preferredMimeType(): string {
   return "";
 }
 
-async function postJson<T>(url: string, body: Record<string, unknown>): Promise<T> {
-  const response = await fetchWithRetry(url, {
+async function postJson<T>(
+  authenticatedFetch: AuthenticatedFetch,
+  url: string,
+  body: Record<string, unknown>,
+): Promise<T> {
+  const response = await authenticatedFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -108,11 +115,13 @@ function activeSessionFromCreatedSession(
   };
 }
 
-export function CameraRecorder() {
+function CameraRecorderInner() {
   const router = useRouter();
+  const { authFetch, getIdToken } = useAuth();
   const previewRef = useRef<HTMLVideoElement | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const authTokenRef = useRef<string | null>(null);
   const sessionRef = useRef<JsonStudySession | null>(null);
   const uploadPromisesRef = useRef<Promise<void>[]>([]);
   const successfulChunkCountRef = useRef(0);
@@ -127,6 +136,7 @@ export function CameraRecorder() {
   const shouldContinueRecordingRef = useRef(false);
 
   const [targetStudyMinutes, setTargetStudyMinutes] = useState(60);
+  const [isTargetStudyMinutesValid, setIsTargetStudyMinutesValid] = useState(true);
   const [phase, setPhase] = useState<RecorderPhase>("setup");
   const [actualStudySec, setActualStudySec] = useState(0);
   const [isBreakActive, setIsBreakActive] = useState(false);
@@ -144,6 +154,41 @@ export function CameraRecorder() {
     typeof window === "undefined" ? null : loadActiveSession(),
   );
 
+  const authFetchWithRetry = useCallback(
+    async (
+      input: RequestInfo | URL,
+      init: RequestInit = {},
+      options: { retries?: number; delayMs?: number } = {},
+    ) => {
+      const token = await getIdToken();
+      const headers = new Headers(init.headers);
+      headers.set("Authorization", `Bearer ${token}`);
+
+      return fetchWithRetry(input, { ...init, headers }, options);
+    },
+    [getIdToken],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    getIdToken()
+      .then((token) => {
+        if (!cancelled) {
+          authTokenRef.current = token;
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          authTokenRef.current = null;
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [getIdToken]);
+
   const refreshPendingCount = useCallback(async (sessionId?: string) => {
     if (typeof indexedDB === "undefined") {
       return;
@@ -159,6 +204,7 @@ export function CameraRecorder() {
     });
 
     const uploadData = await postJson<UploadUrlResponse>(
+      authFetchWithRetry,
       `/api/sessions/${chunk.sessionId}/upload-url`,
       {
         segmentIndex: chunk.segmentIndex,
@@ -179,12 +225,16 @@ export function CameraRecorder() {
       throw new Error("GCS chunk upload failed.");
     }
 
-    await postJson<{ ok: true }>(`/api/sessions/${chunk.sessionId}/chunk-complete`, {
-      segmentIndex: chunk.segmentIndex,
-      chunkIndex: chunk.chunkIndex,
-      objectPath: uploadData.objectPath,
-      sizeBytes: chunk.sizeBytes,
-    });
+    await postJson<{ ok: true }>(
+      authFetchWithRetry,
+      `/api/sessions/${chunk.sessionId}/chunk-complete`,
+      {
+        segmentIndex: chunk.segmentIndex,
+        chunkIndex: chunk.chunkIndex,
+        objectPath: uploadData.objectPath,
+        sizeBytes: chunk.sizeBytes,
+      },
+    );
     successfulChunkCountRef.current += 1;
     await updateStoredChunk(chunk.id, {
       uploadStatus: "uploaded",
@@ -192,7 +242,7 @@ export function CameraRecorder() {
       errorMessage: null,
     });
     await deleteStoredChunk(chunk.id);
-  }, []);
+  }, [authFetchWithRetry]);
 
   const uploadPendingChunks = useCallback(
     async (sessionId?: string) => {
@@ -228,7 +278,7 @@ export function CameraRecorder() {
       return;
     }
 
-    void fetch(`/api/sessions/${active.sessionId}`, { cache: "no-store" })
+    void authFetch(`/api/sessions/${active.sessionId}`, { cache: "no-store" })
       .then((response) => {
         if (!response.ok) {
           throw new Error("セッションを取得できませんでした。");
@@ -243,7 +293,7 @@ export function CameraRecorder() {
         ) {
           setResumableSession(body.session);
           setTargetStudyMinutes(body.session.targetStudyMinutes ?? active.targetStudyMinutes);
-          void fetch(`/api/sessions/${body.session.id}/interrupt`, {
+          void authFetch(`/api/sessions/${body.session.id}/interrupt`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -258,7 +308,7 @@ export function CameraRecorder() {
         clearActiveSession();
         setActiveSessionState(null);
       });
-  }, [refreshPendingCount]);
+  }, [authFetch, refreshPendingCount]);
 
   useEffect(() => {
     const cleanupOnline = onOnline(() => {
@@ -270,7 +320,7 @@ export function CameraRecorder() {
       markInterrupted("network_offline");
       const session = sessionRef.current;
       if (session) {
-        void fetchWithRetry(`/api/sessions/${session.id}/upload-pending`, {
+        void authFetchWithRetry(`/api/sessions/${session.id}/upload-pending`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -284,7 +334,7 @@ export function CameraRecorder() {
       cleanupOnline();
       cleanupOffline();
     };
-  }, [activeSessionState?.sessionId, uploadPendingChunks]);
+  }, [activeSessionState?.sessionId, authFetchWithRetry, uploadPendingChunks]);
 
   useEffect(() => {
     if (phase !== "recording") {
@@ -294,12 +344,12 @@ export function CameraRecorder() {
     const heartbeat = setInterval(() => {
       const session = sessionRef.current;
       if (session && isOnline()) {
-        void fetch(`/api/sessions/${session.id}/heartbeat`, { method: "POST" });
+        void authFetch(`/api/sessions/${session.id}/heartbeat`, { method: "POST" });
       }
     }, 30_000);
 
     return () => clearInterval(heartbeat);
-  }, [phase]);
+  }, [authFetch, phase]);
 
   useEffect(() => {
     if (phase !== "recording") {
@@ -316,10 +366,18 @@ export function CameraRecorder() {
         reason: "tab_closed",
         uploadStatus: pendingUploadCount > 0 ? "offline_pending" : "uploaded",
       });
-      navigator.sendBeacon(
-        `/api/sessions/${session.id}/interrupt`,
-        new Blob([payload], { type: "application/json" }),
-      );
+      const token = authTokenRef.current;
+      if (token) {
+        void fetch(`/api/sessions/${session.id}/interrupt`, {
+          method: "POST",
+          keepalive: true,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: payload,
+        });
+      }
     }
 
     window.addEventListener("beforeunload", handleBeforeUnload);
@@ -421,7 +479,7 @@ export function CameraRecorder() {
     if (!isOnline()) {
       setOnline(false);
       setMessage("オフラインです。動画chunkはこのブラウザに一時保存しています。");
-      await fetchWithRetry(`/api/sessions/${sessionId}/upload-pending`, {
+      await authFetchWithRetry(`/api/sessions/${sessionId}/upload-pending`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -576,10 +634,15 @@ export function CameraRecorder() {
   }
 
   async function handleStart() {
+    if (!isTargetStudyMinutesValid || targetStudyMinutes < 1 || targetStudyMinutes > 720) {
+      setMessage("1分以上720分以下の半角数字で入力してください。");
+      return;
+    }
+
     setIsBusy(true);
     setMessage(null);
     try {
-      const created = await postJson<SessionResponse>("/api/sessions", {
+      const created = await postJson<SessionResponse>(authFetchWithRetry, "/api/sessions", {
         targetStudyMinutes,
       });
       saveActiveSession(activeSessionFromCreatedSession(created.session, targetStudyMinutes));
@@ -606,6 +669,7 @@ export function CameraRecorder() {
     setMessage(null);
     try {
       const response = await postJson<ResumeResponse>(
+        authFetchWithRetry,
         `/api/sessions/${resumableSession.id}/resume`,
         {},
       );
@@ -630,7 +694,7 @@ export function CameraRecorder() {
   async function handleDiscardResume() {
     const session = resumableSession;
     if (session) {
-      await fetch(`/api/sessions/${session.id}/interrupt`, {
+      await authFetch(`/api/sessions/${session.id}/interrupt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -653,7 +717,11 @@ export function CameraRecorder() {
     setIsBusy(true);
     try {
       if (isBreakActive) {
-        await postJson<{ ok: true }>(`/api/sessions/${session.id}/break/end`, {});
+        await postJson<{ ok: true }>(
+          authFetchWithRetry,
+          `/api/sessions/${session.id}/break/end`,
+          {},
+        );
         if (breakStartedAtRef.current !== null) {
           accumulatedBreakSecRef.current += Math.floor(
             (Date.now() - breakStartedAtRef.current) / 1000,
@@ -667,7 +735,11 @@ export function CameraRecorder() {
           accumulatedBreakSec: accumulatedBreakSecRef.current,
         });
       } else {
-        await postJson<{ ok: true }>(`/api/sessions/${session.id}/break/start`, {});
+        await postJson<{ ok: true }>(
+          authFetchWithRetry,
+          `/api/sessions/${session.id}/break/start`,
+          {},
+        );
         breakStartedAtRef.current = Date.now();
         setIsBreakActive(true);
         updateBreakState({
@@ -744,24 +816,17 @@ export function CameraRecorder() {
 
     setIsBusy(true);
     setPhase("processing");
-    setMessage("タイムラプスを生成しています。長めの録画では数分かかります。");
+    setMessage("タイムラプス生成を開始しています。");
     try {
       if (successfulChunkCountRef.current === 0) {
         throw new Error("録画chunkがないためタイムラプスを生成できません。");
       }
-      await postJson<SessionResponse>(`/api/sessions/${session.id}/finish`, {
+      await postJson<SessionResponse>(authFetchWithRetry, `/api/sessions/${session.id}/finish`, {
         studyContent,
         quality,
         reflectionNote,
       });
       clearActiveSession();
-      const processResponse = await fetch(`/api/sessions/${session.id}/process`, {
-        method: "POST",
-      });
-      if (!processResponse.ok) {
-        const body = (await processResponse.json().catch(() => ({}))) as { error?: string };
-        throw new Error(body.error ?? "タイムラプス生成を開始できませんでした。");
-      }
       router.push(`/sessions/${session.id}`);
     } catch (error) {
       const errorMessage =
@@ -870,20 +935,16 @@ export function CameraRecorder() {
       ) : null}
       <div className="grid gap-5 md:grid-cols-2">
         <StudyMinutesControl
+          key={targetStudyMinutes}
           label="目標勉強時間（分）"
           value={targetStudyMinutes}
           onChange={setTargetStudyMinutes}
+          onValidityChange={setIsTargetStudyMinutesValid}
         />
-        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-4">
-          <p className="text-sm font-medium text-zinc-700">タイムラプス速度</p>
-          <p className="mt-2 text-sm text-zinc-600">
-            終了時の実勉強時間で自動決定します。45分未満は30x、45分以上2時間未満は60x、2時間以上は120xです。
-          </p>
-        </div>
       </div>
       <button
         type="button"
-        disabled={isBusy || targetStudyMinutes <= 0}
+        disabled={isBusy || !isTargetStudyMinutesValid || targetStudyMinutes <= 0}
         onClick={handleStart}
         className="mt-6 inline-flex items-center gap-2 rounded-md bg-zinc-950 px-4 py-2 text-white hover:bg-zinc-800 disabled:opacity-50"
       >
@@ -893,4 +954,22 @@ export function CameraRecorder() {
       {message ? <p className="mt-4 text-sm text-red-700">{message}</p> : null}
     </section>
   );
+}
+
+export function CameraRecorder() {
+  const { isLoading, user } = useAuth();
+
+  if (isLoading) {
+    return (
+      <section className="rounded-lg border border-zinc-200 bg-white p-6 text-sm text-zinc-500">
+        認証確認中...
+      </section>
+    );
+  }
+
+  if (!user) {
+    return <AuthGate />;
+  }
+
+  return <CameraRecorderInner />;
 }

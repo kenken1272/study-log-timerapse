@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { PlayCircle } from "lucide-react";
+import { useAuth } from "@/hooks/use-auth";
 import type { JsonStudySession } from "@/lib/sessions/types";
 
 type SessionThumbnailProps = {
@@ -9,6 +10,7 @@ type SessionThumbnailProps = {
 };
 
 export function SessionThumbnail({ session }: SessionThumbnailProps) {
+  const { authFetch } = useAuth();
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
 
   useEffect(() => {
@@ -17,7 +19,7 @@ export function SessionThumbnail({ session }: SessionThumbnailProps) {
     }
 
     let cancelled = false;
-    fetch(`/api/sessions/${session.id}/thumbnail-url`)
+    authFetch(`/api/sessions/${session.id}/thumbnail-url`)
       .then((response) => {
         if (!response.ok) {
           throw new Error("Thumbnail is not ready.");
@@ -39,7 +41,7 @@ export function SessionThumbnail({ session }: SessionThumbnailProps) {
     return () => {
       cancelled = true;
     };
-  }, [session.id, session.status, session.thumbnailPath]);
+  }, [authFetch, session.id, session.status, session.thumbnailPath]);
 
   const label = session.status === "ready" ? "再生" : "詳細";
   const imageUrl = session.status === "ready" ? thumbnailUrl : null;

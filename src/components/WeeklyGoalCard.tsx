@@ -9,6 +9,7 @@ type WeeklyGoalCardProps = {
 
 export function WeeklyGoalCard({ stats }: WeeklyGoalCardProps) {
   const percent = Math.min(100, stats.weeklyAchievementRate);
+  const weeklyGoalHours = stats.targetWeeklyStudyMinutes / 60;
 
   return (
     <section className="rounded-lg border border-zinc-200 bg-white p-5">
@@ -16,7 +17,7 @@ export function WeeklyGoalCard({ stats }: WeeklyGoalCardProps) {
         <div>
           <p className="text-sm text-zinc-500">週間目標</p>
           <h2 className="mt-1 text-xl font-semibold">
-            {formatDuration(stats.weekStudySec)} / {stats.targetWeeklyStudyMinutes}分
+            {formatDuration(stats.weekStudySec)} / {weeklyGoalHours.toLocaleString("ja-JP")}時間
           </h2>
         </div>
         <Link

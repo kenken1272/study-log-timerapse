@@ -2,10 +2,9 @@ import { createHash } from "node:crypto";
 import { Storage } from "@google-cloud/storage";
 import { GoogleAuth } from "google-auth-library";
 
-const DEFAULT_BUCKET_NAME = "vla-test1-study-timelapse";
 const DEFAULT_SIGNING_SERVICE_ACCOUNT_EMAIL =
   "study-timelapse-sa@vla-test1.iam.gserviceaccount.com";
-const SIGNED_URL_TTL_SEC = 15 * 60;
+const SIGNED_URL_TTL_SEC = 150 * 60;
 
 let storage: Storage | null = null;
 let googleAuth: GoogleAuth | null = null;
@@ -31,7 +30,12 @@ function getGoogleAuth(): GoogleAuth {
 }
 
 export function getBucketName(): string {
-  return process.env.GCS_BUCKET_NAME ?? DEFAULT_BUCKET_NAME;
+  const bucketName = process.env.GCS_BUCKET_NAME;
+  if (!bucketName) {
+    throw new Error("GCS_BUCKET_NAME is not set.");
+  }
+
+  return bucketName;
 }
 
 function getSigningServiceAccountEmail(): string {
@@ -44,6 +48,44 @@ function getSigningServiceAccountEmail(): string {
 
 export function getBucket() {
   return getStorageClient().bucket(getBucketName());
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === 404
+  );
+}
+
+export function userProfilePath(uid: string): string {
+  return `users/${uid}/profile.json`;
+}
+
+export function userSessionPrefix(uid: string, sessionId: string): string {
+  return `users/${uid}/sessions/${sessionId}/`;
+}
+
+export function userSessionMetadataPath(uid: string, sessionId: string): string {
+  return `${userSessionPrefix(uid, sessionId)}metadata.json`;
+}
+
+export function userSessionTimelapsePath(uid: string, sessionId: string): string {
+  return `${userSessionPrefix(uid, sessionId)}timelapse.mp4`;
+}
+
+export function userSessionThumbnailPath(uid: string, sessionId: string): string {
+  return `${userSessionPrefix(uid, sessionId)}thumbnail.jpg`;
+}
+
+export function userSessionChunkPath(input: {
+  uid: string;
+  sessionId: string;
+  segmentIndex: number;
+  chunkIndex: number;
+}): string {
+  return `${userSessionPrefix(input.uid, input.sessionId)}segments/${input.segmentIndex}/chunks/${input.chunkIndex}.webm`;
 }
 
 export async function downloadObjectToFile(
@@ -73,6 +115,39 @@ export async function uploadFileToObject(
         : 0;
 
   return { sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : 0 };
+}
+
+export async function uploadJsonToObject(
+  objectPath: string,
+  value: unknown,
+): Promise<void> {
+  await getBucket().file(objectPath).save(`${JSON.stringify(value, null, 2)}\n`, {
+    contentType: "application/json",
+    resumable: false,
+  });
+}
+
+export async function downloadJsonFromObject<T>(objectPath: string): Promise<T | null> {
+  try {
+    const [buffer] = await getBucket().file(objectPath).download();
+    return JSON.parse(buffer.toString("utf8")) as T;
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+export async function listObjectPaths(input: {
+  prefix: string;
+  suffix?: string;
+}): Promise<string[]> {
+  const [files] = await getBucket().getFiles({ prefix: input.prefix });
+  return files
+    .map((file) => file.name)
+    .filter((name) => (input.suffix ? name.endsWith(input.suffix) : true));
 }
 
 export async function deleteObjectIfExists(objectPath: string): Promise<boolean> {
@@ -111,9 +186,9 @@ export async function deleteObjects(
   return { deletedCount, failed };
 }
 
-export async function deleteSessionObjects(sessionId: string): Promise<void> {
+export async function deleteSessionObjects(uid: string, sessionId: string): Promise<void> {
   await getBucket().deleteFiles({
-    prefix: `users/local/sessions/${sessionId}/`,
+    prefix: userSessionPrefix(uid, sessionId),
     force: true,
   });
 }

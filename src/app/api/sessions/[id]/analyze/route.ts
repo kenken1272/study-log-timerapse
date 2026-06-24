@@ -1,7 +1,8 @@
 import { after, NextResponse } from "next/server";
+import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
 import { analyzeStudyVideo, getVertexModelName } from "@/lib/vertex/analyzeStudyVideo";
 import {
-  getSession,
+  getSessionForUser,
   toJsonSession,
   updateSessionAnalysisDone,
   updateSessionAnalysisFailed,
@@ -15,12 +16,15 @@ type RouteContext = {
   params: Promise<{ id: string }>;
 };
 
-export async function POST(_request: Request, context: RouteContext) {
-  const { id } = await context.params;
+export async function POST(request: Request, context: RouteContext) {
+  let id = "";
   const model = getVertexModelName();
 
   try {
-    const session = await getSession(id);
+    const decodedToken = await requireAuthenticatedUser(request);
+    const params = await context.params;
+    id = params.id;
+    const session = await getSessionForUser(id, decodedToken.uid);
     if (!session) {
       return NextResponse.json({ error: "Session not found." }, { status: 404 });
     }
@@ -54,7 +58,7 @@ export async function POST(_request: Request, context: RouteContext) {
       }
     });
 
-    const updated = await getSession(id);
+    const updated = await getSessionForUser(id, decodedToken.uid);
     if (!updated) {
       return NextResponse.json({ error: "Session not found after analysis." }, { status: 404 });
     }
@@ -62,9 +66,11 @@ export async function POST(_request: Request, context: RouteContext) {
     return NextResponse.json({ ok: true, session: toJsonSession(updated) }, { status: 202 });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Analysis failed.";
-    await updateSessionAnalysisFailed({ sessionId: id, model, errorMessage: message }).catch(
-      () => undefined,
-    );
-    return NextResponse.json({ error: message }, { status: 500 });
+    if (id) {
+      await updateSessionAnalysisFailed({ sessionId: id, model, errorMessage: message }).catch(
+        () => undefined,
+      );
+    }
+    return jsonError(error, 500);
   }
 }

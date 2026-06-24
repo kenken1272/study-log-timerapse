@@ -3,9 +3,8 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Sparkles } from "lucide-react";
+import { useAuth } from "@/hooks/use-auth";
 import type { JsonStudySession } from "@/lib/sessions/types";
-
-const GEMINI_ANALYSIS_CODE = "1272";
 
 type AnalyzeButtonProps = {
   session: JsonStudySession;
@@ -15,36 +14,32 @@ type AnalyzeButtonProps = {
 
 function labelForStatus(status: JsonStudySession["analysisStatus"]): string {
   if (status === "done") {
-    return "再分析";
+    return "AI分析を再実行";
   }
   if (status === "failed") {
-    return "分析再実行";
+    return "AI分析を再実行";
   }
   if (status === "processing") {
-    return "分析中";
+    return "AI分析中";
   }
 
-  return "Geminiで集中度分析";
+  return "AI分析を実行";
 }
 
 export function AnalyzeButton({ session, onAnalyzed, compact = false }: AnalyzeButtonProps) {
   const router = useRouter();
+  const { authFetch } = useAuth();
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysisCode, setAnalysisCode] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const canAnalyze = session.status === "ready" && session.timelapsePath !== null;
-  const canRunGeminiAnalysis = canAnalyze && analysisCode.trim() === GEMINI_ANALYSIS_CODE;
+  const canRunAnalysis =
+    canAnalyze && !isAnalyzing && session.analysisStatus !== "processing";
 
   async function handleAnalyze() {
-    if (!canRunGeminiAnalysis) {
-      setErrorMessage("Gemini集中度判定コードを入力してください。");
-      return;
-    }
-
     setIsAnalyzing(true);
     setErrorMessage(null);
     try {
-      const response = await fetch(`/api/sessions/${session.id}/analyze`, {
+      const response = await authFetch(`/api/sessions/${session.id}/analyze`, {
         method: "POST",
       });
       const body = (await response.json().catch(() => ({}))) as {
@@ -69,25 +64,10 @@ export function AnalyzeButton({ session, onAnalyzed, compact = false }: AnalyzeB
 
   return (
     <div className="space-y-2">
-      <label className="block max-w-xs">
-        <span className="text-sm font-medium text-zinc-700">Gemini判定コード</span>
-        <input
-          type="password"
-          inputMode="numeric"
-          value={analysisCode}
-          onChange={(event) => setAnalysisCode(event.target.value)}
-          className="mt-2 w-full rounded-md border border-zinc-300 px-3 py-2 outline-none focus:border-emerald-500"
-        />
-      </label>
       <button
         type="button"
         onClick={handleAnalyze}
-        disabled={
-          !canAnalyze ||
-          !canRunGeminiAnalysis ||
-          isAnalyzing ||
-          session.analysisStatus === "processing"
-        }
+        disabled={!canRunAnalysis}
         className={
           compact
             ? "inline-flex items-center gap-2 rounded-md bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700 disabled:opacity-50"

@@ -5,7 +5,10 @@ import {
   deleteObjects,
   downloadObjectToFile,
   uploadFileToObject,
+  userSessionThumbnailPath,
+  userSessionTimelapsePath,
 } from "@/lib/gcp/storage";
+import { writeSessionMetadata } from "@/lib/gcp/userData";
 import {
   getSession,
   getAutoTimelapseSpeed,
@@ -68,7 +71,7 @@ export async function processTimelapse(sessionId: string): Promise<string> {
     const localFiles: string[] = [];
 
     for (const chunk of sortedChunks) {
-      const localPath = path.join(chunksDir, `${chunk.segmentIndex}-${chunk.index}.webm`);
+      const localPath = path.join(chunksDir, `${chunk.segmentIndex}-${chunk.index}.mp4`);
       await downloadObjectToFile(chunk.objectPath, localPath);
       localFiles.push(localPath);
     }
@@ -116,14 +119,16 @@ export async function processTimelapse(sessionId: string): Promise<string> {
       thumbnailLocalPath,
     ]);
 
-    const timelapsePath = `users/local/sessions/${sessionId}/timelapse.mp4`;
-    const thumbnailPath = `users/local/sessions/${sessionId}/thumbnail.jpg`;
+    const timelapsePath = userSessionTimelapsePath(session.ownerUid, sessionId);
+    const thumbnailPath = userSessionThumbnailPath(session.ownerUid, sessionId);
     const timelapseUpload = await uploadFileToObject(
       outputPath,
       timelapsePath,
       "video/mp4",
     );
     await uploadFileToObject(thumbnailLocalPath, thumbnailPath, "image/jpeg");
+    console.log(`Saved timelapse: ${timelapsePath}`);
+    console.log(`Saved thumbnail: ${thumbnailPath}`);
     await updateSessionReady(
       sessionId,
       timelapsePath,
@@ -167,6 +172,10 @@ export async function processTimelapse(sessionId: string): Promise<string> {
       const cleanupMessage =
         cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error.";
       await updateSessionCleanupFailed(sessionId, cleanupMessage);
+    }
+    const finalSession = await getSession(sessionId);
+    if (finalSession) {
+      await writeSessionMetadata(finalSession);
     }
     await rm(workDir, { recursive: true, force: true });
 

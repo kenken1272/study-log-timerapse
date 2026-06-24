@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { interruptSession } from "@/lib/sessions/firestore";
+import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
+import { getSessionForUser, interruptSession } from "@/lib/sessions/firestore";
 import { readJsonRecord } from "@/lib/validation";
 import type { InterruptionReason, UploadStatus } from "@/lib/sessions/types";
 
@@ -40,7 +41,12 @@ function uploadStatusValue(value: unknown): UploadStatus | undefined {
 
 export async function POST(request: Request, context: RouteContext) {
   try {
+    const decodedToken = await requireAuthenticatedUser(request);
     const { id } = await context.params;
+    const session = await getSessionForUser(id, decodedToken.uid);
+    if (!session) {
+      return NextResponse.json({ error: "Session not found." }, { status: 404 });
+    }
     const body = await readJsonRecord(request);
     await interruptSession({
       sessionId: id,
@@ -50,7 +56,6 @@ export async function POST(request: Request, context: RouteContext) {
 
     return NextResponse.json({ ok: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid request.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return jsonError(error);
   }
 }

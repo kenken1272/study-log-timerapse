@@ -10,32 +10,20 @@ export async function GET(request: Request) {
   try {
     const decodedToken = await requireAuthenticatedUser(request);
     const profile = await ensureUserProfile(decodedToken);
-    return NextResponse.json({
-      targetWeeklyStudyMinutes: Math.round(profile.weeklyGoalHours * 60),
-      weeklyGoalHours: profile.weeklyGoalHours,
-    });
+    return NextResponse.json({ profile });
   } catch (error) {
     return jsonError(error);
   }
 }
 
-export async function PUT(request: Request) {
+export async function PATCH(request: Request) {
   try {
     const decodedToken = await requireAuthenticatedUser(request);
     const body = await readJsonRecord(request);
-    const targetWeeklyStudyMinutes = nonNegativeNumber(
-      body.targetWeeklyStudyMinutes,
-      "targetWeeklyStudyMinutes",
-    );
-    const profile = await updateUserWeeklyGoalHours(
-      decodedToken,
-      targetWeeklyStudyMinutes / 60,
-    );
+    const weeklyGoalHours = nonNegativeNumber(body.weeklyGoalHours, "weeklyGoalHours");
+    const profile = await updateUserWeeklyGoalHours(decodedToken, weeklyGoalHours);
 
-    return NextResponse.json({
-      targetWeeklyStudyMinutes: Math.round(profile.weeklyGoalHours * 60),
-      weeklyGoalHours: profile.weeklyGoalHours,
-    });
+    return NextResponse.json({ profile });
   } catch (error) {
     return jsonError(error);
   }

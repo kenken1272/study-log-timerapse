@@ -6,10 +6,11 @@ type StatsCardsProps = {
 };
 
 export function StatsCards({ stats }: StatsCardsProps) {
+  const weeklyGoalHours = stats.targetWeeklyStudyMinutes / 60;
   const cards = [
     { label: "今日", value: formatDuration(stats.todayStudySec) },
     { label: "今週", value: formatDuration(stats.weekStudySec) },
-    { label: "週間目標", value: `${stats.targetWeeklyStudyMinutes}分` },
+    { label: "週間目標", value: `${weeklyGoalHours.toLocaleString("ja-JP")}時間` },
     { label: "達成率", value: `${Math.round(stats.weeklyAchievementRate)}%` },
     { label: "総勉強時間", value: formatDuration(stats.totalStudySec) },
     { label: "総休憩時間", value: formatDuration(stats.totalBreakSec) },

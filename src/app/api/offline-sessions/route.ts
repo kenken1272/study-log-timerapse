@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
+import { ensureUserProfile, writeSessionMetadata } from "@/lib/gcp/userData";
 import { createOfflineSession, toJsonSession } from "@/lib/sessions/firestore";
 import {
   nonNegativeNumber,
@@ -14,8 +16,11 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
   try {
+    const decodedToken = await requireAuthenticatedUser(request);
+    await ensureUserProfile(decodedToken);
     const body = await readJsonRecord(request);
     const session = await createOfflineSession({
+      ownerUid: decodedToken.uid,
       studyDate: requiredString(body.studyDate, "studyDate", 20),
       studyMinutes: positiveNumber(body.studyMinutes, "studyMinutes"),
       breakMinutes: nonNegativeNumber(body.breakMinutes ?? 0, "breakMinutes"),
@@ -23,10 +28,10 @@ export async function POST(request: Request) {
       quality: qualityValue(body.quality),
       reflectionNote: optionalString(body.reflectionNote, 5000),
     });
+    await writeSessionMetadata(session);
 
     return NextResponse.json({ session: toJsonSession(session) }, { status: 201 });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid request.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return jsonError(error);
   }
 }

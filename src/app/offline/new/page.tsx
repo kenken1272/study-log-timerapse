@@ -4,13 +4,16 @@ import { FormEvent, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Save } from "lucide-react";
+import { AuthGate } from "@/components/auth/AuthGate";
 import { QualitySelector } from "@/components/QualitySelector";
 import { StudyMinutesControl } from "@/components/StudyMinutesControl";
+import { useAuth } from "@/hooks/use-auth";
 import type { JsonStudySession, StudyQuality } from "@/lib/sessions/types";
 import { dateInputValue } from "@/lib/time/format";
 
 export default function OfflineSessionPage() {
   const router = useRouter();
+  const { authFetch, isLoading: isAuthLoading, user } = useAuth();
   const [studyDate, setStudyDate] = useState(dateInputValue(new Date()));
   const [studyMinutes, setStudyMinutes] = useState(60);
   const [breakMinutes, setBreakMinutes] = useState(0);
@@ -25,7 +28,7 @@ export default function OfflineSessionPage() {
     setIsSaving(true);
     setMessage(null);
     try {
-      const response = await fetch("/api/offline-sessions", {
+      const response = await authFetch("/api/offline-sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -47,6 +50,37 @@ export default function OfflineSessionPage() {
     } finally {
       setIsSaving(false);
     }
+  }
+
+  if (isAuthLoading) {
+    return (
+      <main className="min-h-screen bg-zinc-50 text-zinc-950">
+        <div className="mx-auto w-full max-w-3xl px-4 py-8 md:px-6">
+          <div className="rounded-lg border border-zinc-200 bg-white p-6 text-sm text-zinc-500">
+            認証確認中...
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main className="min-h-screen bg-zinc-50 text-zinc-950">
+        <div className="mx-auto w-full max-w-3xl px-4 py-8 md:px-6">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2 text-sm text-zinc-600 hover:text-zinc-950"
+          >
+            <ArrowLeft size={16} />
+            ダッシュボードへ
+          </Link>
+          <div className="mt-8">
+            <AuthGate />
+          </div>
+        </div>
+      </main>
+    );
   }
 
   return (
@@ -74,6 +108,7 @@ export default function OfflineSessionPage() {
           </label>
           <div className="grid gap-4 md:grid-cols-2">
             <StudyMinutesControl
+              key={studyMinutes}
               label="勉強時間（分）"
               value={studyMinutes}
               onChange={setStudyMinutes}

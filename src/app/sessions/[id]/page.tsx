@@ -6,15 +6,17 @@ import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, Pencil, RotateCw, Save, Trash2, X } from "lucide-react";
 import { AnalysisResultCard } from "@/components/AnalysisResultCard";
 import { AnalyzeButton } from "@/components/AnalyzeButton";
-import { LocalAnalyzeButton } from "@/components/LocalAnalyzeButton";
+import { AuthGate } from "@/components/auth/AuthGate";
 import { QualitySelector } from "@/components/QualitySelector";
 import { VideoPlayer } from "@/components/VideoPlayer";
+import { useAuth } from "@/hooks/use-auth";
 import type { JsonStudySession, StudyQuality } from "@/lib/sessions/types";
 import { formatDuration, formatShortDate } from "@/lib/time/format";
 
 export default function SessionDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
+  const { authFetch, isLoading: isAuthLoading, user } = useAuth();
   const [session, setSession] = useState<JsonStudySession | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -26,7 +28,7 @@ export default function SessionDetailPage() {
   const [editReflectionNote, setEditReflectionNote] = useState("");
 
   const loadSession = useCallback(async () => {
-    const response = await fetch(`/api/sessions/${params.id}`, { cache: "no-store" });
+    const response = await authFetch(`/api/sessions/${params.id}`, { cache: "no-store" });
     if (!response.ok) {
       throw new Error("セッションを取得できませんでした。");
     }
@@ -35,12 +37,16 @@ export default function SessionDetailPage() {
     setEditStudyContent(body.session.studyContent ?? "");
     setEditQuality(body.session.quality ?? 3);
     setEditReflectionNote(body.session.reflectionNote ?? "");
-  }, [params.id]);
+  }, [authFetch, params.id]);
 
   useEffect(() => {
+    if (isAuthLoading || !user) {
+      return;
+    }
+
     let cancelled = false;
 
-    fetch(`/api/sessions/${params.id}`, { cache: "no-store" })
+    authFetch(`/api/sessions/${params.id}`, { cache: "no-store" })
       .then((response) => {
         if (!response.ok) {
           throw new Error("セッションを取得できませんでした。");
@@ -65,7 +71,7 @@ export default function SessionDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [params.id]);
+  }, [authFetch, isAuthLoading, params.id, user]);
 
   useEffect(() => {
     if (!session) {
@@ -74,8 +80,7 @@ export default function SessionDetailPage() {
 
     const shouldPoll =
       session.status === "processing" ||
-      session.analysisStatus === "processing" ||
-      session.localAnalysisStatus === "processing";
+      session.analysisStatus === "processing";
     if (!shouldPoll) {
       return;
     }
@@ -91,7 +96,6 @@ export default function SessionDetailPage() {
     loadSession,
     session,
     session?.analysisStatus,
-    session?.localAnalysisStatus,
     session?.status,
   ]);
 
@@ -99,7 +103,7 @@ export default function SessionDetailPage() {
     setIsProcessing(true);
     setError(null);
     try {
-      const response = await fetch(`/api/sessions/${params.id}/process`, { method: "POST" });
+      const response = await authFetch(`/api/sessions/${params.id}/process`, { method: "POST" });
       if (!response.ok) {
         throw new Error("タイムラプス生成に失敗しました。");
       }
@@ -121,7 +125,7 @@ export default function SessionDetailPage() {
     setIsSaving(true);
     setError(null);
     try {
-      const response = await fetch(`/api/sessions/${session.id}`, {
+      const response = await authFetch(`/api/sessions/${session.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -159,7 +163,7 @@ export default function SessionDetailPage() {
     setIsDeleting(true);
     setError(null);
     try {
-      const response = await fetch(`/api/sessions/${session.id}`, {
+      const response = await authFetch(`/api/sessions/${session.id}`, {
         method: "DELETE",
       });
       if (!response.ok) {
@@ -172,6 +176,26 @@ export default function SessionDetailPage() {
       setError(deleteError instanceof Error ? deleteError.message : "削除に失敗しました。");
       setIsDeleting(false);
     }
+  }
+
+  if (isAuthLoading) {
+    return (
+      <main className="min-h-screen bg-zinc-50 px-4 py-8 text-zinc-950">
+        <div className="mx-auto max-w-4xl rounded-lg border border-zinc-200 bg-white p-6 text-sm text-zinc-500">
+          認証確認中...
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main className="min-h-screen bg-zinc-50 px-4 py-8 text-zinc-950">
+        <div className="mx-auto max-w-4xl">
+          <AuthGate />
+        </div>
+      </main>
+    );
   }
 
   if (!session) {
@@ -321,35 +345,22 @@ export default function SessionDetailPage() {
           <section className="rounded-lg border border-zinc-200 bg-white p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
-                <h2 className="text-xl font-semibold">集中度分析</h2>
+                <h2 className="text-xl font-semibold">AI分析</h2>
                 <p className="mt-2 text-sm text-zinc-500">
                   分析は自動では実行されません。ボタンを押したときだけ実行されます。
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
                 <AnalyzeButton session={session} onAnalyzed={setSession} />
-                <LocalAnalyzeButton session={session} onAnalyzed={setSession} />
               </div>
             </div>
-            <div className="mt-5 grid gap-4 md:grid-cols-2">
-              <div className="rounded-lg border border-zinc-100 bg-zinc-50 p-4">
-                <AnalysisResultCard
-                  title="Gemini分析"
-                  model={session.analysisModel}
-                  status={session.analysisStatus}
-                  result={session.analysisResult}
-                  errorMessage={session.analysisErrorMessage}
-                />
-              </div>
-              <div className="rounded-lg border border-zinc-100 bg-zinc-50 p-4">
-                <AnalysisResultCard
-                  title="ローカル分析"
-                  model={session.localAnalysisModel ?? "Qwen2.5-VL"}
-                  status={session.localAnalysisStatus}
-                  result={session.localAnalysisResult}
-                  errorMessage={session.localAnalysisErrorMessage}
-                />
-              </div>
+            <div className="mt-5 rounded-lg border border-zinc-100 bg-zinc-50 p-4">
+              <AnalysisResultCard
+                title="AI分析結果"
+                status={session.analysisStatus}
+                result={session.analysisResult}
+                errorMessage={session.analysisErrorMessage}
+              />
             </div>
           </section>
         ) : null}

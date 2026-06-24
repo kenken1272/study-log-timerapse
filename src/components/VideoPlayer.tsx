@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useAuth } from "@/hooks/use-auth";
 
 type VideoPlayerProps = {
   sessionId: string;
@@ -8,6 +9,7 @@ type VideoPlayerProps = {
 };
 
 export function VideoPlayer({ sessionId, isReady }: VideoPlayerProps) {
+  const { authFetch } = useAuth();
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,7 +20,7 @@ export function VideoPlayer({ sessionId, isReady }: VideoPlayerProps) {
 
     let cancelled = false;
     async function loadUrl() {
-      const response = await fetch(`/api/sessions/${sessionId}/video-url`);
+      const response = await authFetch(`/api/sessions/${sessionId}/video-url`);
       if (!response.ok) {
         setError("動画URLを取得できませんでした。");
         return;
@@ -33,7 +35,7 @@ export function VideoPlayer({ sessionId, isReady }: VideoPlayerProps) {
     return () => {
       cancelled = true;
     };
-  }, [isReady, sessionId]);
+  }, [authFetch, isReady, sessionId]);
 
   if (!isReady) {
     return <p className="text-sm text-zinc-500">タイムラプス動画はまだ準備中です。</p>;

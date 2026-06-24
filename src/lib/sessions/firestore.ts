@@ -114,9 +114,6 @@ export function toJsonSession(session: StudySession): JsonStudySession {
     analysisRequestedAt: timestampToIso(session.analysisRequestedAt),
     analysisStartedAt: timestampToIso(session.analysisStartedAt),
     analysisFinishedAt: timestampToIso(session.analysisFinishedAt),
-    localAnalysisRequestedAt: timestampToIso(session.localAnalysisRequestedAt),
-    localAnalysisStartedAt: timestampToIso(session.localAnalysisStartedAt),
-    localAnalysisFinishedAt: timestampToIso(session.localAnalysisFinishedAt),
   };
 }
 
@@ -132,6 +129,7 @@ function snapshotToSession(
 
   return {
     id: snapshot.id,
+    ownerUid: typeof data.ownerUid === "string" ? data.ownerUid : "local",
     type: data.type ?? "recorded",
     targetStudyMinutes: data.targetStudyMinutes ?? null,
     targetStudySec: data.targetStudySec ?? null,
@@ -172,35 +170,28 @@ function snapshotToSession(
     analysisModel: data.analysisModel ?? null,
     analysisErrorMessage: data.analysisErrorMessage ?? null,
     analysisResult: data.analysisResult ?? null,
-    localAnalysisStatus: data.localAnalysisStatus ?? "none",
-    localAnalysisRequestedAt: data.localAnalysisRequestedAt ?? null,
-    localAnalysisStartedAt: data.localAnalysisStartedAt ?? null,
-    localAnalysisFinishedAt: data.localAnalysisFinishedAt ?? null,
-    localAnalysisModel: data.localAnalysisModel ?? null,
-    localAnalysisErrorMessage: data.localAnalysisErrorMessage ?? null,
-    localAnalysisResult: data.localAnalysisResult ?? null,
     createdAt: data.createdAt ?? now,
     updatedAt: data.updatedAt ?? now,
   };
 }
 
-export async function listSessions(limit = 50): Promise<StudySession[]> {
-  const snapshot = await sessionCollection()
-    .orderBy("startedAt", "desc")
-    .limit(limit)
-    .get();
+export async function listSessions(ownerUid: string, limit = 50): Promise<StudySession[]> {
+  const snapshot = await sessionCollection().where("ownerUid", "==", ownerUid).get();
 
   return snapshot.docs
     .map((doc) => snapshotToSession(doc))
-    .filter((session): session is StudySession => session !== null);
+    .filter((session): session is StudySession => session !== null)
+    .sort((left, right) => right.startedAt.toMillis() - left.startedAt.toMillis())
+    .slice(0, limit);
 }
 
-export async function listAllSessions(): Promise<StudySession[]> {
-  const snapshot = await sessionCollection().orderBy("startedAt", "desc").get();
+export async function listAllSessions(ownerUid: string): Promise<StudySession[]> {
+  const snapshot = await sessionCollection().where("ownerUid", "==", ownerUid).get();
 
   return snapshot.docs
     .map((doc) => snapshotToSession(doc))
-    .filter((session): session is StudySession => session !== null);
+    .filter((session): session is StudySession => session !== null)
+    .sort((left, right) => right.startedAt.toMillis() - left.startedAt.toMillis());
 }
 
 export async function getSession(id: string): Promise<StudySession | null> {
@@ -208,7 +199,16 @@ export async function getSession(id: string): Promise<StudySession | null> {
   return snapshotToSession(snapshot);
 }
 
+export async function getSessionForUser(
+  id: string,
+  ownerUid: string,
+): Promise<StudySession | null> {
+  const session = await getSession(id);
+  return session?.ownerUid === ownerUid ? session : null;
+}
+
 export async function createRecordedSession(
+  ownerUid: string,
   targetStudyMinutes: number,
   speed: TimelapseSpeed,
 ): Promise<StudySession> {
@@ -216,6 +216,7 @@ export async function createRecordedSession(
   const now = Timestamp.now();
   const session: StudySession = {
     id: doc.id,
+    ownerUid,
     type: "recorded",
     targetStudyMinutes,
     targetStudySec: Math.round(targetStudyMinutes * 60),
@@ -263,13 +264,6 @@ export async function createRecordedSession(
     analysisModel: null,
     analysisErrorMessage: null,
     analysisResult: null,
-    localAnalysisStatus: "none",
-    localAnalysisRequestedAt: null,
-    localAnalysisStartedAt: null,
-    localAnalysisFinishedAt: null,
-    localAnalysisModel: null,
-    localAnalysisErrorMessage: null,
-    localAnalysisResult: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -279,6 +273,7 @@ export async function createRecordedSession(
 }
 
 export async function createOfflineSession(input: {
+  ownerUid: string;
   studyDate: string;
   studyMinutes: number;
   breakMinutes: number;
@@ -293,6 +288,7 @@ export async function createOfflineSession(input: {
   const totalBreakSec = Math.round(input.breakMinutes * 60);
   const session: StudySession = {
     id: doc.id,
+    ownerUid: input.ownerUid,
     type: "offline",
     targetStudyMinutes: null,
     targetStudySec: null,
@@ -333,13 +329,6 @@ export async function createOfflineSession(input: {
     analysisModel: null,
     analysisErrorMessage: null,
     analysisResult: null,
-    localAnalysisStatus: "none",
-    localAnalysisRequestedAt: null,
-    localAnalysisStartedAt: null,
-    localAnalysisFinishedAt: null,
-    localAnalysisModel: null,
-    localAnalysisErrorMessage: null,
-    localAnalysisResult: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -642,11 +631,11 @@ export async function updateSessionFailed(
   });
 }
 
-export async function listResumableSessions(): Promise<StudySession[]> {
+export async function listResumableSessions(ownerUid: string): Promise<StudySession[]> {
   const snapshot = await sessionCollection()
     .where("resumable", "==", true)
     .orderBy("updatedAt", "desc")
-    .limit(10)
+    .limit(50)
     .get();
 
   return snapshot.docs
@@ -654,11 +643,13 @@ export async function listResumableSessions(): Promise<StudySession[]> {
     .filter((session): session is StudySession => {
       return (
         session !== null &&
+        session.ownerUid === ownerUid &&
         (session.status === "recording" ||
           session.status === "interrupted" ||
           session.status === "paused")
       );
-    });
+    })
+    .slice(0, 10);
 }
 
 export async function heartbeatSession(sessionId: string): Promise<void> {
@@ -780,49 +771,6 @@ export async function updateSessionAnalysisFailed(input: {
     analysisFinishedAt: now,
     analysisModel: input.model,
     analysisErrorMessage: input.errorMessage,
-    updatedAt: now,
-  });
-}
-
-export async function updateSessionLocalAnalysisProcessing(input: {
-  sessionId: string;
-}): Promise<void> {
-  const now = Timestamp.now();
-  await sessionCollection().doc(input.sessionId).update({
-    localAnalysisStatus: "processing" satisfies AnalysisStatus,
-    localAnalysisRequestedAt: now,
-    localAnalysisStartedAt: now,
-    localAnalysisFinishedAt: null,
-    localAnalysisErrorMessage: null,
-    updatedAt: now,
-  });
-}
-
-export async function updateSessionLocalAnalysisDone(input: {
-  sessionId: string;
-  model: string;
-  analysisResult: AnalysisResult;
-}): Promise<void> {
-  const now = Timestamp.now();
-  await sessionCollection().doc(input.sessionId).update({
-    localAnalysisStatus: "done" satisfies AnalysisStatus,
-    localAnalysisFinishedAt: now,
-    localAnalysisModel: input.model,
-    localAnalysisErrorMessage: null,
-    localAnalysisResult: input.analysisResult,
-    updatedAt: now,
-  });
-}
-
-export async function updateSessionLocalAnalysisFailed(input: {
-  sessionId: string;
-  errorMessage: string;
-}): Promise<void> {
-  const now = Timestamp.now();
-  await sessionCollection().doc(input.sessionId).update({
-    localAnalysisStatus: "failed" satisfies AnalysisStatus,
-    localAnalysisFinishedAt: now,
-    localAnalysisErrorMessage: input.errorMessage,
     updatedAt: now,
   });
 }

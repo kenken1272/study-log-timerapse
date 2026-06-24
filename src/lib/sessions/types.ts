@@ -23,7 +23,6 @@ export type InterruptionReason =
   | "manual_pause"
   | "unknown";
 export type AnalysisStatus = "none" | "pending" | "processing" | "done" | "failed";
-export type LocalAnalysisStatus = AnalysisStatus;
 export type TimelapseSpeed = 30 | 60 | 120;
 export type StudyQuality = 1 | 2 | 3 | 4 | 5;
 export type FocusLabel = "かなり低い" | "低い" | "普通" | "高い" | "とても高い";
@@ -67,6 +66,7 @@ export type StudyAnalysisResult = AnalysisResult;
 
 export type StudySession = {
   id: string;
+  ownerUid: string;
   type: SessionType;
   targetStudyMinutes: number | null;
   targetStudySec: number | null;
@@ -107,13 +107,6 @@ export type StudySession = {
   analysisModel: string | null;
   analysisErrorMessage: string | null;
   analysisResult: AnalysisResult | null;
-  localAnalysisStatus: LocalAnalysisStatus;
-  localAnalysisRequestedAt: Timestamp | null;
-  localAnalysisStartedAt: Timestamp | null;
-  localAnalysisFinishedAt: Timestamp | null;
-  localAnalysisModel: string | null;
-  localAnalysisErrorMessage: string | null;
-  localAnalysisResult: AnalysisResult | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 };
@@ -148,9 +141,6 @@ export type JsonStudySession = Omit<
   | "analysisRequestedAt"
   | "analysisStartedAt"
   | "analysisFinishedAt"
-  | "localAnalysisRequestedAt"
-  | "localAnalysisStartedAt"
-  | "localAnalysisFinishedAt"
 > & {
   startedAt: string;
   endedAt: string | null;
@@ -165,9 +155,6 @@ export type JsonStudySession = Omit<
   analysisRequestedAt: string | null;
   analysisStartedAt: string | null;
   analysisFinishedAt: string | null;
-  localAnalysisRequestedAt: string | null;
-  localAnalysisStartedAt: string | null;
-  localAnalysisFinishedAt: string | null;
 };
 
 export type DashboardStats = {

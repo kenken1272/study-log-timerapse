@@ -3,16 +3,23 @@
 import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Save } from "lucide-react";
+import { AuthGate } from "@/components/auth/AuthGate";
+import { useAuth } from "@/hooks/use-auth";
 
 export default function WeeklyGoalSettingsPage() {
+  const { authFetch, isLoading: isAuthLoading, refreshProfile, user } = useAuth();
   const [unit, setUnit] = useState<"hours" | "minutes">("hours");
   const [value, setValue] = useState(10);
   const [message, setMessage] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
+    if (isAuthLoading || !user) {
+      return;
+    }
+
     async function loadGoal() {
-      const response = await fetch("/api/settings/weekly-goal", { cache: "no-store" });
+      const response = await authFetch("/api/settings/weekly-goal", { cache: "no-store" });
       if (!response.ok) {
         return;
       }
@@ -27,7 +34,7 @@ export default function WeeklyGoalSettingsPage() {
     }
 
     void loadGoal();
-  }, []);
+  }, [authFetch, isAuthLoading, user]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -35,7 +42,7 @@ export default function WeeklyGoalSettingsPage() {
     setMessage(null);
     try {
       const targetWeeklyStudyMinutes = unit === "hours" ? value * 60 : value;
-      const response = await fetch("/api/settings/weekly-goal", {
+      const response = await authFetch("/api/settings/weekly-goal", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ targetWeeklyStudyMinutes }),
@@ -43,12 +50,44 @@ export default function WeeklyGoalSettingsPage() {
       if (!response.ok) {
         throw new Error("保存に失敗しました。");
       }
+      await refreshProfile();
       setMessage("週間目標を保存しました。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存に失敗しました。");
     } finally {
       setIsSaving(false);
     }
+  }
+
+  if (isAuthLoading) {
+    return (
+      <main className="min-h-screen bg-zinc-50 text-zinc-950">
+        <div className="mx-auto w-full max-w-2xl px-4 py-8 md:px-6">
+          <div className="rounded-lg border border-zinc-200 bg-white p-6 text-sm text-zinc-500">
+            認証確認中...
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main className="min-h-screen bg-zinc-50 text-zinc-950">
+        <div className="mx-auto w-full max-w-2xl px-4 py-8 md:px-6">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2 text-sm text-zinc-600 hover:text-zinc-950"
+          >
+            <ArrowLeft size={16} />
+            ダッシュボードへ
+          </Link>
+          <div className="mt-8">
+            <AuthGate />
+          </div>
+        </div>
+      </main>
+    );
   }
 
   return (

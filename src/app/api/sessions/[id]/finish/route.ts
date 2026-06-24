@@ -1,5 +1,14 @@
 import { NextResponse } from "next/server";
-import { finishSession, getSession, toJsonSession } from "@/lib/sessions/firestore";
+import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
+import { enqueueTimelapseProcessingTask } from "@/lib/gcp/tasks";
+import { writeSessionMetadata } from "@/lib/gcp/userData";
+import {
+  finishSession,
+  getSessionForUser,
+  toJsonSession,
+  updateSessionFailed,
+  updateSessionProcessing,
+} from "@/lib/sessions/firestore";
 import {
   optionalString,
   qualityValue,
@@ -16,11 +25,12 @@ type RouteContext = {
 
 export async function POST(request: Request, context: RouteContext) {
   try {
+    const decodedToken = await requireAuthenticatedUser(request);
     const { id } = await context.params;
     const body = await readJsonRecord(request);
-    const existing = await getSession(id);
+    const existing = await getSessionForUser(id, decodedToken.uid);
     if (!existing) {
-      throw new Error("Session not found.");
+      return NextResponse.json({ error: "Session not found." }, { status: 404 });
     }
     if (existing.uploadStatus === "offline_pending" || existing.uploadStatus === "uploading") {
       throw new Error("未アップロードchunkがあります。アップロード完了後に終了してください。");
@@ -32,10 +42,22 @@ export async function POST(request: Request, context: RouteContext) {
       quality: qualityValue(body.quality),
       reflectionNote: optionalString(body.reflectionNote, 5000),
     });
+    await writeSessionMetadata(session);
+    if (session.type === "recorded") {
+      await updateSessionProcessing(id);
+      try {
+        await enqueueTimelapseProcessingTask(id);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "タイムラプス生成を開始できませんでした。";
+        await updateSessionFailed(id, message);
+        throw error;
+      }
+    }
 
-    return NextResponse.json({ session: toJsonSession(session) });
+    const updated = await getSessionForUser(id, decodedToken.uid);
+    return NextResponse.json({ session: toJsonSession(updated ?? session) });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid request.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return jsonError(error);
   }
 }

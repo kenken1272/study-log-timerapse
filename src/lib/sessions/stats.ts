@@ -1,5 +1,5 @@
 import type { DashboardStats, StudySession } from "@/lib/sessions/types";
-import { getWeeklyGoalMinutes, listAllSessions } from "@/lib/sessions/firestore";
+import { listAllSessions } from "@/lib/sessions/firestore";
 
 function startOfToday(): Date {
   const now = new Date();
@@ -18,11 +18,12 @@ function isAfterOrSame(session: StudySession, boundary: Date): boolean {
   return session.startedAt.toDate().getTime() >= boundary.getTime();
 }
 
-export async function getDashboardStats(): Promise<DashboardStats> {
-  const [sessions, targetWeeklyStudyMinutes] = await Promise.all([
-    listAllSessions(),
-    getWeeklyGoalMinutes(),
-  ]);
+export async function getDashboardStats(input: {
+  ownerUid: string;
+  targetWeeklyStudyMinutes: number;
+}): Promise<DashboardStats> {
+  const sessions = await listAllSessions(input.ownerUid);
+  const targetWeeklyStudyMinutes = input.targetWeeklyStudyMinutes;
   const today = startOfToday();
   const week = startOfWeekMonday();
   const todayStudySec = sessions

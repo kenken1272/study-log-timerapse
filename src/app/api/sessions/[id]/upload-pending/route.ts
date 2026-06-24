@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
-import { registerChunk, updateUploadStatus } from "@/lib/sessions/firestore";
+import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
+import { userSessionChunkPath } from "@/lib/gcp/storage";
+import {
+  getSessionForUser,
+  registerChunk,
+  updateUploadStatus,
+} from "@/lib/sessions/firestore";
 import {
   integerValue,
   nonNegativeNumber,
@@ -31,7 +37,12 @@ function uploadStatusValue(value: unknown): UploadStatus {
 
 export async function POST(request: Request, context: RouteContext) {
   try {
+    const decodedToken = await requireAuthenticatedUser(request);
     const { id } = await context.params;
+    const session = await getSessionForUser(id, decodedToken.uid);
+    if (!session) {
+      return NextResponse.json({ error: "Session not found." }, { status: 404 });
+    }
     const body = await readJsonRecord(request);
 
     if (typeof body.objectPath === "string") {
@@ -41,11 +52,21 @@ export async function POST(request: Request, context: RouteContext) {
         body.chunkIndex === undefined
           ? integerValue(body.index, "index")
           : integerValue(body.chunkIndex, "chunkIndex");
+      const expectedObjectPath = userSessionChunkPath({
+        uid: decodedToken.uid,
+        sessionId: id,
+        segmentIndex,
+        chunkIndex,
+      });
+      const objectPath = requiredString(body.objectPath, "objectPath", 1000);
+      if (objectPath !== expectedObjectPath) {
+        throw new Error("objectPath does not match the authenticated user.");
+      }
       await registerChunk({
         sessionId: id,
         segmentIndex,
         index: chunkIndex,
-        objectPath: requiredString(body.objectPath, "objectPath", 1000),
+        objectPath,
         sizeBytes: nonNegativeNumber(body.sizeBytes, "sizeBytes"),
       });
     } else {
@@ -54,7 +75,6 @@ export async function POST(request: Request, context: RouteContext) {
 
     return NextResponse.json({ ok: true });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid request.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return jsonError(error);
   }
 }
