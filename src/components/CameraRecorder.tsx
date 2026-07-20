@@ -47,6 +47,8 @@ const UPLOAD_RETRIES = 2;
 const UPLOAD_RETRY_DELAY_MS = 1_500;
 // Stopping must not block forever on a wedged upload.
 const UPLOAD_DRAIN_TIMEOUT_MS = 15_000;
+// Give up a backlog sweep after this many transient failures in a row.
+const MAX_CONSECUTIVE_UPLOAD_FAILURES = 3;
 const MIN_CHUNK_DURATION_MS = 1_000;
 
 type SessionResponse = {
@@ -79,6 +81,25 @@ function preferredMimeType(): string {
   return "";
 }
 
+class HttpStatusError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "HttpStatusError";
+    this.status = status;
+  }
+}
+
+/**
+ * A chunk that can never be uploaded, however many times it is retried —
+ * its session was deleted, or belongs to someone else. Retrying these forever
+ * would block every other chunk behind them in the queue.
+ */
+function isUnrecoverable(error: unknown): boolean {
+  return error instanceof HttpStatusError && (error.status === 404 || error.status === 403);
+}
+
 async function postJson<T>(
   authenticatedFetch: AuthenticatedFetch,
   url: string,
@@ -92,7 +113,7 @@ async function postJson<T>(
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(errorBody.error ?? "Request failed.");
+    throw new HttpStatusError(response.status, errorBody.error ?? "Request failed.");
   }
 
   return (await response.json()) as T;
@@ -306,6 +327,10 @@ function CameraRecorderInner() {
             return;
           } catch (error) {
             lastError = error;
+            if (isUnrecoverable(error)) {
+              // The session is gone. More attempts cannot change that.
+              break;
+            }
             if (attempt < UPLOAD_RETRIES) {
               await new Promise((resolve) =>
                 window.setTimeout(resolve, UPLOAD_RETRY_DELAY_MS * (attempt + 1)),
@@ -316,7 +341,9 @@ function CameraRecorderInner() {
 
         // Never leave the chunk stuck on `uploading`: that is invisible to the
         // user and nothing retries it. The blob itself is kept for retry.
-        const message = friendlyFetchError(lastError, "chunk upload failed.");
+        const message = isUnrecoverable(lastError)
+          ? "このchunkの録画セッションが見つかりません。すでに削除された可能性があります。"
+          : friendlyFetchError(lastError, "chunk upload failed.");
         await updateStoredChunk(chunk.id, {
           uploadStatus: "failed",
           errorMessage: message,
@@ -336,19 +363,40 @@ function CameraRecorderInner() {
 
       const pending = await listPendingChunks(sessionId);
       setPendingUploadCount(pending.length);
+
+      let consecutiveTransientFailures = 0;
+      let skipped = 0;
+
       for (const chunk of pending) {
         try {
           await uploadStoredChunk(chunk);
+          consecutiveTransientFailures = 0;
         } catch (error) {
-          // uploadStoredChunk already recorded the per-chunk status and
-          // message. Stop the sweep so a persistent outage does not spend the
-          // whole backlog's retries at once; the rest stay queued.
+          if (isUnrecoverable(error)) {
+            // Skip and keep going. With a large backlog, stopping at the first
+            // dead session would strand every healthy chunk behind it.
+            skipped += 1;
+            continue;
+          }
+
+          consecutiveTransientFailures += 1;
           setMessage(friendlyFetchError(error, "chunk upload failed."));
-          break;
+          // Repeated transient failures mean the network or server is down;
+          // stop rather than spending the whole backlog's retries against it.
+          if (consecutiveTransientFailures >= MAX_CONSECUTIVE_UPLOAD_FAILURES) {
+            break;
+          }
         } finally {
           await refreshPendingCount(sessionId);
           await refreshFailedChunks(sessionId);
         }
+      }
+
+      if (skipped > 0) {
+        setMessage(
+          `${skipped}件のchunkは録画セッションが見つからないためアップロードできません。`
+          + "他のchunkは処理を続けています。",
+        );
       }
     },
     [refreshFailedChunks, refreshPendingCount, uploadStoredChunk],
