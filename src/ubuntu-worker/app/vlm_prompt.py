@@ -46,8 +46,31 @@ def build_user_prompt(offsets_seconds: list[float], duration_seconds: float) -> 
 
 
 def build_messages(offsets_seconds: list[float], duration_seconds: float) -> list[dict]:
-    """Chat messages with one image placeholder per sampled frame."""
+    """Chat messages with one bare image placeholder per sampled frame.
+
+    Mllama's processor takes the images separately and only needs a positional
+    placeholder here.
+    """
     content: list[dict] = [{"type": "image"} for _ in offsets_seconds]
+    content.append(
+        {"type": "text", "text": build_user_prompt(offsets_seconds, duration_seconds)}
+    )
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {"role": "user", "content": content},
+    ]
+
+
+def build_messages_with_images(
+    images: list, offsets_seconds: list[float], duration_seconds: float
+) -> list[dict]:
+    """Chat messages carrying the images inline.
+
+    Gemma 3's chat template resolves the images itself, so they must be embedded
+    in the message content rather than passed alongside it. Frames stay in
+    chronological order and each one's timestamp is stated in the text.
+    """
+    content: list[dict] = [{"type": "image", "image": image} for image in images]
     content.append(
         {"type": "text", "text": build_user_prompt(offsets_seconds, duration_seconds)}
     )

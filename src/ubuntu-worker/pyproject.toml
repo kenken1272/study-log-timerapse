@@ -20,9 +20,10 @@ dependencies = [
 [project.optional-dependencies]
 # Heavyweight inference stack. Not needed for the mock test suite.
 vlm = [
-  "transformers==4.45.2",
-  "accelerate==1.0.1",
-  "bitsandbytes==0.44.1",
+  # >=4.50 is required for Gemma3ForConditionalGeneration; 4.45 does not have it.
+  "transformers==4.51.3",
+  "accelerate==1.6.0",
+  "bitsandbytes==0.45.3",
   "pillow==10.4.0",
 ]
 dev = [

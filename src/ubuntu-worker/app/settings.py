@@ -61,6 +61,7 @@ class Settings:
 
     # --- VLM ---
     vlm_model_id: str
+    vlm_architecture: str
     vlm_revision: str | None
     vlm_profile: str
     vlm_slo_ms: int
@@ -111,6 +112,8 @@ def load_settings() -> Settings:
         vlm_model_id=os.environ.get(
             "VLM_MODEL_ID", "meta-llama/Llama-3.2-11B-Vision-Instruct"
         ),
+        # auto | gemma3 | mllama. "auto" infers from the model id.
+        vlm_architecture=os.environ.get("VLM_ARCHITECTURE", "auto"),
         vlm_revision=os.environ.get("VLM_REVISION") or None,
         vlm_profile=os.environ.get("VLM_PROFILE", "original_8"),
         vlm_slo_ms=_env_int("VLM_SLO_MS", 25_000),

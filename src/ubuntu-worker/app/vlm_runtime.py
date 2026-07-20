@@ -1,15 +1,28 @@
-"""Llama-3.2-11B-Vision-Instruct at 4-bit, held resident on the VLM GPU.
+"""The per-chunk vision model, held resident at 4-bit on the VLM GPU.
 
 The model is loaded once at service start and never unloaded during normal
 operation — a per-chunk load would blow the 25s SLO on its own.
 
 Compute dtype is float16, not bfloat16: the TITAN RTX is Turing (sm_75), which
-has no native bf16 path.
+has no native bf16 path. This matters more for Gemma 3 than for Llama, because
+Gemma 3 is natively a bf16 model and much published guidance assumes bf16 is
+available.
+
+Two architectures are supported behind one interface so the same 30s chunk can
+be scored by either and the results compared directly:
+
+  * ``mllama``  — meta-llama/Llama-3.2-11B-Vision-Instruct (gated; pending)
+  * ``gemma3``  — google/gemma-3-12b-it, google/gemma-3-4b-it
+
+They differ only in how images reach the processor; the output schema, prompt
+text and validation are shared, so switching model does not change what the UI
+receives. Selected with VLM_MODEL_ID plus VLM_ARCHITECTURE=auto|gemma3|mllama.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,12 +30,37 @@ from typing import Protocol
 
 from app import gpu_manager
 from app.schemas import ChunkMetrics, parse_model_json
-from app.vlm_prompt import build_messages
+from app.vlm_prompt import build_messages, build_messages_with_images
 from app.video_frames import ExtractedFrames
 
 log = logging.getLogger(__name__)
 
 QUANTIZATION = "4bit-nf4"
+
+ARCH_MLLAMA = "mllama"
+ARCH_GEMMA3 = "gemma3"
+
+
+def detect_architecture(model_id: str) -> str:
+    """Infer the architecture from the model id.
+
+    Kept deliberately dumb and overridable via VLM_ARCHITECTURE: guessing wrong
+    fails loudly at load time rather than producing subtly wrong inputs.
+    """
+    lowered = model_id.lower()
+    # "paligemma-3b" contains the substring "gemma-3" but is a different
+    # architecture entirely, and is out of scope for this project.
+    if "paligemma" in lowered:
+        raise SchemaViolation(
+            f"PaliGemma is not supported ({model_id!r}); use a Gemma 3 IT model"
+        )
+    if re.search(r"gemma-?3[-_]", lowered) or lowered.endswith("gemma-3"):
+        return ARCH_GEMMA3
+    if "llama-3.2" in lowered and "vision" in lowered:
+        return ARCH_MLLAMA
+    raise SchemaViolation(
+        f"cannot infer architecture for {model_id!r}; set VLM_ARCHITECTURE explicitly"
+    )
 
 
 class SchemaViolation(Exception):
@@ -51,22 +89,36 @@ class TransformersVlmRuntime:
     """Real implementation. Imports torch lazily so tests stay importable."""
 
     def __init__(self, model_id: str, gpu_index: int, revision: str | None = None,
-                 max_new_tokens: int = 512) -> None:
+                 max_new_tokens: int = 512, architecture: str = "auto") -> None:
         self.model_id = model_id
         self.quantization = QUANTIZATION
+        self.architecture = (
+            detect_architecture(model_id) if architecture == "auto" else architecture
+        )
         self._gpu_index = gpu_index
         self._revision = revision
         self._max_new_tokens = max_new_tokens
         self._model = None
         self._processor = None
 
+    def _model_class(self):
+        from transformers import MllamaForConditionalGeneration
+
+        if self.architecture == ARCH_GEMMA3:
+            # Only importable on transformers >= 4.50; fail with a useful
+            # message rather than an opaque ImportError.
+            try:
+                from transformers import Gemma3ForConditionalGeneration
+            except ImportError as error:
+                raise SchemaViolation(
+                    "Gemma 3 needs transformers>=4.50; upgrade the venv"
+                ) from error
+            return Gemma3ForConditionalGeneration
+        return MllamaForConditionalGeneration
+
     def load(self) -> None:
         import torch
-        from transformers import (
-            AutoProcessor,
-            BitsAndBytesConfig,
-            MllamaForConditionalGeneration,
-        )
+        from transformers import AutoProcessor, BitsAndBytesConfig
 
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -77,9 +129,12 @@ class TransformersVlmRuntime:
         )
         kwargs = {"revision": self._revision} if self._revision else {}
 
-        log.info("loading %s onto cuda:%d (4bit nf4)", self.model_id, self._gpu_index)
+        log.info(
+            "loading %s (%s) onto cuda:%d (4bit nf4, fp16 compute)",
+            self.model_id, self.architecture, self._gpu_index,
+        )
         started = time.perf_counter()
-        self._model = MllamaForConditionalGeneration.from_pretrained(
+        self._model = self._model_class().from_pretrained(
             self.model_id,
             quantization_config=quant_config,
             device_map={"": self._gpu_index},
@@ -88,7 +143,25 @@ class TransformersVlmRuntime:
         )
         self._processor = AutoProcessor.from_pretrained(self.model_id, **kwargs)
         self._model.eval()
-        log.info("model loaded in %.1fs", time.perf_counter() - started)
+        self.load_seconds = time.perf_counter() - started
+        log.info("model loaded in %.1fs", self.load_seconds)
+
+    def _prepare_inputs(self, images: list, offsets: list[float], duration: float):
+        """Build model inputs. The only genuinely architecture-specific step."""
+        if self.architecture == ARCH_GEMMA3:
+            # Gemma 3's template resolves inline images itself.
+            messages = build_messages_with_images(images, offsets, duration)
+            return self._processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+
+        messages = build_messages(offsets, duration)
+        prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
+        return self._processor(images=images, text=prompt, return_tensors="pt")
 
     def warmup(self) -> None:
         """One throwaway generation so the first real chunk is not the outlier."""
@@ -99,15 +172,11 @@ class TransformersVlmRuntime:
             self.load()
 
         blank = Image.new("RGB", (448, 448), color=(16, 16, 16))
-        messages = build_messages([0.0], 30.0)
-        prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = self._processor(images=[blank], text=prompt, return_tensors="pt").to(
-            self._model.device
-        )
+        inputs = self._prepare_inputs([blank], [0.0], 30.0).to(self._model.device)
         with torch.inference_mode():
             self._model.generate(**inputs, max_new_tokens=8, do_sample=False)
         torch.cuda.synchronize(self._gpu_index)
-        log.info("VLM warmup complete")
+        log.info("VLM warmup complete (%s)", self.model_id)
 
     def analyze(self, frames: ExtractedFrames) -> VlmResult:
         import torch
@@ -118,13 +187,13 @@ class TransformersVlmRuntime:
 
         preprocess_started = time.perf_counter()
         images = [Image.open(path).convert("RGB") for path in frames.paths]
-        messages = build_messages(frames.offsets_seconds, frames.duration_seconds)
-        prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = self._processor(images=images, text=prompt, return_tensors="pt").to(
-            self._model.device
-        )
+        inputs = self._prepare_inputs(
+            images, frames.offsets_seconds, frames.duration_seconds
+        ).to(self._model.device)
         torch.cuda.synchronize(self._gpu_index)
         preprocess_ms = int((time.perf_counter() - preprocess_started) * 1000)
+
+        prompt_length = inputs["input_ids"].shape[-1]
 
         generate_started = time.perf_counter()
         with torch.inference_mode():
@@ -139,7 +208,7 @@ class TransformersVlmRuntime:
         generate_ms = int((time.perf_counter() - generate_started) * 1000)
 
         # Strip the echoed prompt; only the completion is parsed.
-        generated = output[0][inputs["input_ids"].shape[-1]:]
+        generated = output[0][prompt_length:]
         text = self._processor.decode(generated, skip_special_tokens=True)
 
         validate_started = time.perf_counter()
@@ -238,4 +307,5 @@ def build_runtime(settings) -> VlmRuntime:
         gpu_index=settings.vlm_gpu,
         revision=settings.vlm_revision,
         max_new_tokens=settings.vlm_max_new_tokens,
+        architecture=settings.vlm_architecture,
     )

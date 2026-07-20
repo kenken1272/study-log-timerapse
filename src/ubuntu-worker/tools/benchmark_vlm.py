@@ -52,6 +52,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunk", required=True, type=Path)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument(
+        "--fallback",
+        action="append",
+        help="Smaller model to try if the configured one misses the SLO at every "
+             "profile. Repeatable, tried in order.",
+    )
     parser.add_argument("--out", type=Path, default=Path("benchmark-vlm.json"))
     args = parser.parse_args()
 
@@ -59,69 +65,109 @@ def main() -> int:
     work_dir = settings.spool_dir / "benchmark"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"GPU state before load: {gpu_manager.memory_used_mib()}")
-    runtime = TransformersVlmRuntime(
-        settings.vlm_model_id, settings.vlm_gpu, settings.vlm_revision,
-        settings.vlm_max_new_tokens,
-    )
-    load_started = time.perf_counter()
-    runtime.load()
-    load_seconds = time.perf_counter() - load_started
-    runtime.warmup()
-    print(f"model loaded and warmed in {load_seconds:.1f}s")
-    print(f"GPU state after load:  {gpu_manager.memory_used_mib()}")
+    # Candidate ladder: the configured model first, then the documented smaller
+    # fallback. Never silently substitute — every attempt is recorded.
+    candidates = [settings.vlm_model_id]
+    for fallback in args.fallback or []:
+        if fallback not in candidates:
+            candidates.append(fallback)
 
-    results: list[dict] = []
-    chosen: str | None = None
+    all_results: list[dict] = []
+    chosen_model: str | None = None
+    chosen_profile: str | None = None
+    load_seconds = 0.0
+    runtime = None
 
-    for profile in PROFILE_ORDER:
-        runs = []
-        failed = False
-        for attempt in range(args.repeat):
-            try:
-                run = measure(runtime, args.chunk, profile, work_dir)
-            except Exception as error:
-                print(f"  {profile} attempt {attempt + 1}: FAILED ({error})")
-                runs.append({"profile": profile, "error": str(error), "json_valid": False})
-                failed = True
-                break
-            runs.append(run)
-            print(
-                f"  {profile} attempt {attempt + 1}: {run['total_ms']}ms "
-                f"({run['resolution']}, {run['frame_count']} frames, "
-                f"{run['peak_vram_mib']}MiB)"
-            )
-        results.extend(runs)
+    for model_id in candidates:
+        print(f"\n=== {model_id} ===")
+        print(f"GPU state before load: {gpu_manager.memory_used_mib()}")
 
-        if failed:
+        if runtime is not None:
+            # Free the previous candidate before loading the next.
+            runtime.unload()
+            time.sleep(3)
+
+        runtime = TransformersVlmRuntime(
+            model_id, settings.vlm_gpu, settings.vlm_revision,
+            settings.vlm_max_new_tokens, settings.vlm_architecture,
+        )
+        try:
+            load_started = time.perf_counter()
+            runtime.load()
+            load_seconds = time.perf_counter() - load_started
+            runtime.warmup()
+        except Exception as error:
+            print(f"  load FAILED: {error}")
+            all_results.append({"model": model_id, "error": str(error), "json_valid": False})
             continue
 
-        worst = max(run["total_ms"] for run in runs)
-        # Every run must clear the SLO, not just the median — a single 26s chunk
-        # in production is a user-visible stall.
-        if worst <= settings.vlm_slo_ms:
-            chosen = profile
-            print(f"==> {profile} meets the {settings.vlm_slo_ms}ms SLO (worst {worst}ms)")
+        print(f"loaded and warmed in {load_seconds:.1f}s")
+        print(f"GPU state after load:  {gpu_manager.memory_used_mib()}")
+
+        for profile in PROFILE_ORDER:
+            runs = []
+            failed = False
+            for attempt in range(args.repeat):
+                try:
+                    run = measure(runtime, args.chunk, profile, work_dir)
+                except Exception as error:
+                    print(f"  {profile} attempt {attempt + 1}: FAILED ({error})")
+                    runs.append(
+                        {"model": model_id, "profile": profile,
+                         "error": str(error), "json_valid": False}
+                    )
+                    failed = True
+                    break
+                run["model"] = model_id
+                runs.append(run)
+                print(
+                    f"  {profile} attempt {attempt + 1}: {run['total_ms']}ms "
+                    f"({run['resolution']}, {run['frame_count']} frames, "
+                    f"{run['peak_vram_mib']}MiB)"
+                )
+            all_results.extend(runs)
+
+            if failed:
+                continue
+
+            worst = max(run["total_ms"] for run in runs)
+            # Every run must clear the SLO, not just the median — a single 26s
+            # chunk in production is a user-visible stall.
+            if worst <= settings.vlm_slo_ms:
+                chosen_model, chosen_profile = model_id, profile
+                print(f"==> {profile} meets the {settings.vlm_slo_ms}ms SLO (worst {worst}ms)")
+                break
+            print(
+                f"    {profile} worst {worst}ms exceeds {settings.vlm_slo_ms}ms; "
+                "trying a lighter profile"
+            )
+
+        if chosen_profile is not None:
             break
-        print(f"    {profile} worst {worst}ms exceeds {settings.vlm_slo_ms}ms; trying lighter")
+        print(f"--- {model_id} met no profile within the SLO")
 
     payload = {
-        "model": settings.vlm_model_id,
-        "quantization": runtime.quantization,
+        "candidates": candidates,
+        "quantization": runtime.quantization if runtime else None,
+        "architecture": runtime.architecture if runtime else None,
         "gpu": settings.vlm_gpu,
         "slo_ms": settings.vlm_slo_ms,
         "load_seconds": round(load_seconds, 1),
-        "chosen_profile": chosen,
-        "runs": results,
+        "chosen_model": chosen_model,
+        "chosen_profile": chosen_profile,
+        "runs": all_results,
     }
     args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"\nwrote {args.out}")
 
-    if chosen is None:
-        print("WARNING: no profile met the SLO. Investigate before enabling the service.")
+    if chosen_profile is None:
+        print("WARNING: no model/profile combination met the SLO.")
+        print("         Do not enable the service on these numbers.")
         return 1
 
-    print(f"Set VLM_PROFILE={chosen} in config/worker.env")
+    print(f"\nSet in config/worker.env:")
+    print(f"  VLM_MODEL_ID={chosen_model}")
+    print(f"  VLM_PROFILE={chosen_profile}")
     return 0
 
 
