@@ -5,6 +5,9 @@ const DEFAULT_LOCATION = "asia-northeast1";
 const DEFAULT_SERVICE_URL =
   "https://study-timelapse-116342725707.asia-northeast1.run.app";
 const DISPATCH_DEADLINE_SECONDS = 30 * 60;
+// Recovery window for the Ubuntu VLM pipeline before source chunks are removed.
+const DEFAULT_CHUNK_CLEANUP_DELAY_SECONDS = 24 * 60 * 60;
+const MAX_SCHEDULE_AHEAD_SECONDS = 30 * 24 * 60 * 60;
 
 let googleAuth: GoogleAuth | null = null;
 
@@ -40,17 +43,18 @@ function getServiceUrl(): string {
   return (process.env.CLOUD_RUN_SERVICE_URL ?? DEFAULT_SERVICE_URL).replace(/\/$/, "");
 }
 
-export async function enqueueTimelapseProcessingTask(sessionId: string): Promise<string> {
+async function enqueueTask(input: {
+  path: string;
+  payload: Record<string, unknown>;
+  scheduleTime?: Date;
+}): Promise<string> {
   const projectId = getProjectId();
   const location = process.env.CLOUD_TASKS_LOCATION ?? DEFAULT_LOCATION;
   const queue = process.env.CLOUD_TASKS_QUEUE ?? DEFAULT_QUEUE;
   const parent = `projects/${projectId}/locations/${location}/queues/${queue}`;
-  const url = `${getServiceUrl()}/api/sessions/${encodeURIComponent(sessionId)}/do-process`;
+  const url = `${getServiceUrl()}${input.path}`;
   const secret = requiredEnv("INTERNAL_PROCESS_SECRET");
-  const body = Buffer.from(
-    JSON.stringify({ sessionId, source: "cloud-tasks" }),
-    "utf8",
-  ).toString("base64");
+  const body = Buffer.from(JSON.stringify(input.payload), "utf8").toString("base64");
   const accessToken = await getGoogleAuth().getAccessToken();
   if (!accessToken) {
     throw new Error("Could not get Google Cloud access token for Cloud Tasks.");
@@ -69,6 +73,9 @@ export async function enqueueTimelapseProcessingTask(sessionId: string): Promise
       body: JSON.stringify({
         task: {
           dispatchDeadline: `${DISPATCH_DEADLINE_SECONDS}s`,
+          ...(input.scheduleTime
+            ? { scheduleTime: input.scheduleTime.toISOString() }
+            : {}),
           httpRequest: {
             httpMethod: "POST",
             url,
@@ -90,4 +97,39 @@ export async function enqueueTimelapseProcessingTask(sessionId: string): Promise
 
   const task = (await response.json()) as { name?: string };
   return task.name ?? "";
+}
+
+export async function enqueueTimelapseProcessingTask(sessionId: string): Promise<string> {
+  return enqueueTask({
+    path: `/api/sessions/${encodeURIComponent(sessionId)}/do-process`,
+    payload: { sessionId, source: "cloud-tasks" },
+  });
+}
+
+export function getChunkCleanupDelaySeconds(): number {
+  const raw = Number(process.env.CHUNK_CLEANUP_DELAY_SEC);
+  if (!Number.isFinite(raw) || raw < 0) {
+    return DEFAULT_CHUNK_CLEANUP_DELAY_SECONDS;
+  }
+
+  // Cloud Tasks refuses a schedule more than 30 days out.
+  return Math.min(raw, MAX_SCHEDULE_AHEAD_SECONDS);
+}
+
+/**
+ * Schedule source-chunk deletion instead of doing it inline.
+ *
+ * The delay is the recovery window for the Ubuntu VLM pipeline: if that host is
+ * offline when a session finishes, Pub/Sub still holds the events and the
+ * chunks are still there when it comes back.
+ */
+export async function enqueueChunkCleanupTask(
+  sessionId: string,
+  delaySeconds = getChunkCleanupDelaySeconds(),
+): Promise<string> {
+  return enqueueTask({
+    path: `/api/sessions/${encodeURIComponent(sessionId)}/cleanup-chunks`,
+    payload: { sessionId, source: "cloud-tasks" },
+    scheduleTime: new Date(Date.now() + delaySeconds * 1000),
+  });
 }

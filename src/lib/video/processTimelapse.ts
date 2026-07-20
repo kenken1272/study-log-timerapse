@@ -2,18 +2,19 @@ import { spawn } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
-  deleteObjects,
   downloadObjectToFile,
   uploadFileToObject,
   userSessionThumbnailPath,
   userSessionTimelapsePath,
 } from "@/lib/gcp/storage";
+import {
+  enqueueChunkCleanupTask,
+  getChunkCleanupDelaySeconds,
+} from "@/lib/gcp/tasks";
 import { writeSessionMetadata } from "@/lib/gcp/userData";
 import {
   getSession,
   getAutoTimelapseSpeed,
-  updateSessionCleanupDeleting,
-  updateSessionCleanupDone,
   updateSessionCleanupFailed,
   updateSessionFailed,
   updateSessionProcessing,
@@ -136,42 +137,29 @@ export async function processTimelapse(sessionId: string): Promise<string> {
       thumbnailPath,
     );
 
+    // Chunk deletion is deferred rather than done here: the Ubuntu VLM
+    // pipeline reads these same chunks asynchronously, and deleting them now
+    // would make analysis impossible whenever that host is behind or offline.
+    // The timelapse is already uploaded and the session is already `ready`, so
+    // nothing user-visible waits on this.
     try {
-      const chunkObjectPaths = sortedChunks
-        .filter((chunk) => chunk.deletedAt === null)
-        .map((chunk) => chunk.objectPath);
-      const chunksStorageBytes = sortedChunks.reduce(
-        (sum, chunk) => sum + chunk.sizeBytes,
-        0,
+      const delaySeconds = getChunkCleanupDelaySeconds();
+      const taskName = await enqueueChunkCleanupTask(sessionId, delaySeconds);
+      console.log(
+        `Scheduled chunk cleanup for ${sessionId} in ${delaySeconds}s: ${taskName}`,
       );
-      if (chunkObjectPaths.length > 0) {
-        await updateSessionCleanupDeleting(sessionId);
-        const deleteResult = await deleteObjects(chunkObjectPaths);
-        if (deleteResult.failed.length > 0) {
-          await updateSessionCleanupFailed(
-            sessionId,
-            deleteResult.failed
-              .map((failure) => `${failure.objectPath}: ${failure.message}`)
-              .join("\n"),
-          );
-        } else {
-          await updateSessionCleanupDone({
-            sessionId,
-            deletedObjectPaths: chunkObjectPaths,
-            chunksStorageBytes,
-          });
-        }
-      } else {
-        await updateSessionCleanupDone({
-          sessionId,
-          deletedObjectPaths: [],
-          chunksStorageBytes,
-        });
-      }
     } catch (cleanupError) {
+      // A failed schedule leaves the chunks in place, which costs storage but
+      // never loses data. Surfaced on the session so it can be retried.
       const cleanupMessage =
-        cleanupError instanceof Error ? cleanupError.message : "Unknown cleanup error.";
-      await updateSessionCleanupFailed(sessionId, cleanupMessage);
+        cleanupError instanceof Error
+          ? cleanupError.message
+          : "Unknown cleanup scheduling error.";
+      console.error(`[processTimelapse] cleanup scheduling failed: ${cleanupMessage}`);
+      await updateSessionCleanupFailed(
+        sessionId,
+        `Failed to schedule delayed chunk cleanup: ${cleanupMessage}`,
+      );
     }
     const finalSession = await getSession(sessionId);
     if (finalSession) {

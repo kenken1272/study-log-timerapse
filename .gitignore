@@ -15,3 +15,15 @@ pnpm-debug.log*
 coverage
 *.log
 tsconfig.tsbuildinfo
+
+# Ubuntu worker: virtualenvs, model weights, queue state, spooled footage
+.venv*
+__pycache__
+*.pyc
+.pytest_cache
+*.gguf
+*.safetensors
+src/ubuntu-worker/state
+src/ubuntu-worker/spool
+src/ubuntu-worker/models
+src/ubuntu-worker/*.egg-info
