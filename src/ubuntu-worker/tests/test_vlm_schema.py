@@ -113,3 +113,16 @@ def test_rejects_a_multi_entry_array_rather_than_picking_one():
     # and present a partial reading as if it were the whole chunk.
     with pytest.raises(SchemaViolation):
         coerce_metrics(json.dumps([VALID, VALID]))
+
+
+def test_accepts_a_complete_object_followed_by_trailing_content():
+    # A model that answers correctly and then keeps talking has still answered.
+    # Observed from gemma-3-27b-it, which emitted the object then repeated it.
+    noisy = json.dumps(VALID) + "\n" + json.dumps(VALID)
+    metrics = coerce_metrics(noisy)
+    assert metrics.concentration_score == 80
+
+
+def test_accepts_an_object_followed_by_prose():
+    metrics = coerce_metrics(json.dumps(VALID) + "\n\n以上が分析結果です。")
+    assert metrics.presence == "present"

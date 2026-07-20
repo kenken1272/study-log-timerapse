@@ -89,8 +89,8 @@ def test_full_coverage_adds_no_gap_warning():
 
 def test_malformed_recommendations_are_dropped_not_fatal():
     class PartlyBadLlm(MockLlmRuntime):
-        def generate(self, ladder, prompt):
-            output = super().generate(ladder, prompt)
+        def generate(self, ladder, prompt, validate=None):
+            output = super().generate(ladder, prompt, validate)
             output.payload["recommendations"] = [
                 {"priority": 1, "title": "ok", "reason": "r", "action": "a"},
                 {"nonsense": True},
@@ -105,13 +105,41 @@ def test_malformed_recommendations_are_dropped_not_fatal():
 
 def test_invalid_concentration_block_fails_the_report():
     class BadLlm(MockLlmRuntime):
-        def generate(self, ladder, prompt):
-            output = super().generate(ladder, prompt)
+        def generate(self, ladder, prompt, validate=None):
+            output = super().generate(ladder, prompt, validate)
             output.payload["concentration"] = {"average_score": 900, "trend": "sideways"}
+            if validate is not None:
+                validate(output.payload)
             return output
 
-    with pytest.raises(LlmFailed):
+    with pytest.raises(Exception):
         aggregator.build_analysis(make_plan(), make_payloads(60), BadLlm(), LADDER)
+
+
+def test_an_empty_concentration_block_is_rejected_inside_the_ladder():
+    """A rung returning well-formed JSON of the wrong shape must fall through.
+
+    Observed from gemma-3-27b-it: parsed cleanly, but concentration was {}.
+    Validating outside the ladder meant that failed the whole aggregation
+    instead of trying the next rung.
+    """
+    seen = []
+
+    class EmptyConcentrationLlm(MockLlmRuntime):
+        def generate(self, ladder, prompt, validate=None):
+            output = super().generate(ladder, prompt, validate)
+            output.payload["concentration"] = {}
+            if validate is not None:
+                try:
+                    validate(output.payload)
+                except Exception as error:
+                    seen.append(str(error))
+                    raise
+            return output
+
+    with pytest.raises(Exception):
+        aggregator.build_analysis(make_plan(), make_payloads(60), EmptyConcentrationLlm(), LADDER)
+    assert seen and "concentration" in seen[0]
 
 
 def test_prompt_omits_runtime_metadata():
@@ -136,3 +164,51 @@ def test_compact_rows_keep_the_timeline_fields():
     assert compact[0]["score"] == 70
     assert compact[0]["activity"] == "writing"
     assert "t" in compact[0]
+
+
+def test_model_claims_of_missing_data_are_dropped_when_nothing_is_missing():
+    """Observed in production: the 12B warned about gaps at 100% coverage.
+
+    Coverage is computed locally because the model cannot be trusted to report
+    it. Passing its contradicting claim through would tell a user their
+    recording had holes when it did not.
+    """
+    class FabricatingLlm(MockLlmRuntime):
+        def generate(self, ladder, prompt, validate=None):
+            output = super().generate(ladder, prompt, validate)
+            output.payload["data_quality"] = {
+                "coverage_ratio": 0.4,
+                "warnings": ["セッション中に欠損が発生しており、データが完全ではありません。"],
+            }
+            output.payload["recommendations"] = [
+                {"priority": 1, "title": "欠損の調査", "reason": "抜けがある", "action": "確認する"},
+                {"priority": 2, "title": "休憩を挟む", "reason": "後半に離席", "action": "25分で区切る"},
+            ]
+            return output
+
+    analysis = aggregator.build_analysis(
+        make_plan(), make_payloads(60), FabricatingLlm(), LADDER
+    )
+
+    assert analysis.window.missing_chunk_count == 0
+    assert analysis.data_quality.coverage_ratio == 1.0
+    assert analysis.data_quality.warnings == []
+    assert [r.title for r in analysis.recommendations] == ["休憩を挟む"]
+
+
+def test_genuine_gap_warnings_survive_when_data_really_is_missing():
+    class GapAwareLlm(MockLlmRuntime):
+        def generate(self, ladder, prompt, validate=None):
+            output = super().generate(ladder, prompt, validate)
+            output.payload["data_quality"] = {
+                "coverage_ratio": 0.3,
+                "warnings": ["欠損区間があります。"],
+            }
+            return output
+
+    analysis = aggregator.build_analysis(
+        make_plan(), make_payloads(20), GapAwareLlm(), LADDER
+    )
+    assert analysis.window.missing_chunk_count == 40
+    # Our own computed warning, plus the model's, both kept.
+    assert any("欠損" in w for w in analysis.data_quality.warnings)

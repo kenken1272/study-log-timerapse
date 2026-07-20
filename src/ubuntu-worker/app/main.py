@@ -483,8 +483,14 @@ class Worker:
         try:
             self.gcs.upload_json(result_store.status_path(uid, session_id), status.model_dump())
         except Exception:
-            # Status is advisory; never fail a chunk because the badge is stale.
-            log.debug("status publish failed for %s", session_id, exc_info=True)
+            # Advisory, so it must never fail a chunk — but it drives the UI's
+            # progress display, so a persistent failure has to be visible.
+            # Logging this at debug once hid a 403 that silently froze the
+            # status at "1 of 4" for an entire session.
+            log.warning(
+                "status publish failed for %s (UI progress will be stale)",
+                session_id, exc_info=True,
+            )
 
     def health_snapshot(self) -> dict:
         usage = gpu_manager.memory_used_mib()

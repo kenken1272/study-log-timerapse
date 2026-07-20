@@ -162,11 +162,49 @@ gcloud auth application-default print-access-token >/dev/null && echo ok
 If the worker starts logging 401/403 from GCS or Pub/Sub, ADC has expired or
 been revoked — re-run `gcloud auth application-default login` on the host.
 
-A least-privilege service account, `study-timelapse-worker@vla-test1`, exists
-with subscribe + object read + object create and **no** delete. It is currently
-unused. Moving the worker onto it (set `GOOGLE_APPLICATION_CREDENTIALS`, or use
-Workload Identity Federation) removes the risk that a bug could delete a user's
-footage, which ADC from a human account does not prevent.
+The worker impersonates `study-timelapse-worker@vla-test1` via
+`IMPERSONATE_SERVICE_ACCOUNT`. ADC mints a short-lived token for it on demand,
+so **no service account key file exists anywhere**.
+
+Its permissions:
+
+| Role | Scope |
+|---|---|
+| `roles/pubsub.subscriber` | the chunk subscription |
+| `roles/storage.objectViewer` | the bucket |
+| `roles/storage.objectCreator` | the bucket |
+| `roles/storage.objectAdmin` | **conditional**: `resource.name.endsWith('.json')` |
+
+The conditional binding is not optional and the reason is not obvious: **GCS
+requires `storage.objects.delete` to overwrite an existing object.** With
+create-only permission the first `status.json` write succeeds and every
+subsequent one returns 403, silently freezing the UI's progress display. This
+was only caught because a re-run happened to overwrite rather than create.
+
+The condition restricts overwrite/delete to `.json`, so source chunks
+(`.webm`), timelapses (`.mp4`) and thumbnails (`.jpg`) can never be destroyed —
+which is the property that actually matters.
+
+Known limitation: `metadata.json` and `profile.json` also end in `.json`, so
+they fall inside the condition. The worker has no code path that writes or
+deletes them, and `tests/test_no_delete_capability.py` enforces that there is
+no delete call at all — but at the IAM layer this is wider than intended. IAM
+conditions cannot express the needed pattern (`resource.name.contains()` is
+rejected, and the variable uid sits mid-path so `startsWith` cannot reach the
+`analysis/` segment). Tightening further would require a separate bucket for
+analysis output.
+
+Verify the boundary holds:
+
+```bash
+SA=study-timelapse-worker@vla-test1.iam.gserviceaccount.com
+# expected: succeeds
+echo '{}' | gcloud storage cp - gs://BUCKET/users/UID/sessions/SID/analysis/status.json \
+  --impersonate-service-account=$SA
+# expected: denied, object still present
+gcloud storage rm gs://BUCKET/users/UID/sessions/SID/segments/0/chunks/0.webm \
+  --impersonate-service-account=$SA
+```
 
 ## Things that need a human
 

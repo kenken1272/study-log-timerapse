@@ -180,13 +180,26 @@ def build_analysis(
         expected_chunk_count=expected,
     )
 
-    output = llm.generate(ladder, prompt)
+    def _validate(payload: dict) -> None:
+        """Reject a rung whose output cannot populate the report."""
+        block = payload.get("concentration")
+        if not isinstance(block, dict) or not block:
+            raise LlmFailed("concentration block missing or empty")
+        Concentration.model_validate(block)
+        if not str(payload.get("summary") or "").strip():
+            raise LlmFailed("summary missing")
+
+    output = llm.generate(ladder, prompt, validate=_validate)
     payload = output.payload
 
     warnings: list[str] = []
     raw_quality = payload.get("data_quality") or {}
     if isinstance(raw_quality.get("warnings"), list):
-        warnings = [str(item) for item in raw_quality["warnings"]][:20]
+        warnings = [
+            str(item)
+            for item in raw_quality["warnings"]
+            if not _contradicts_coverage(str(item), missing)
+        ][:20]
     if missing > 0:
         warnings.insert(
             0,
@@ -215,14 +228,32 @@ def build_analysis(
         concentration=concentration,
         observed_patterns=[str(item) for item in (payload.get("observed_patterns") or [])][:20],
         bottlenecks=[str(item) for item in (payload.get("bottlenecks") or [])][:20],
-        recommendations=_coerce_recommendations(payload.get("recommendations")),
+        recommendations=_coerce_recommendations(payload.get("recommendations"), missing),
         data_quality=DataQuality(coverage_ratio=ratio, warnings=warnings),
         runtime=output.runtime,
         generated_at=utc_now_iso(),
     )
 
 
-def _coerce_recommendations(raw) -> list:
+# Words a model reaches for when claiming data is incomplete.
+_GAP_TERMS = ("欠損", "不完全", "抜け", "missing", "incomplete", "gap")
+
+
+def _contradicts_coverage(text: str, missing: int) -> bool:
+    """Drop model claims of missing data when no data is missing.
+
+    Coverage is computed locally precisely because the model cannot be trusted
+    to report it — observed in production, gemma-3-12b-it warned about gaps and
+    recommended investigating them for a window with 100% coverage. Surfacing
+    that would tell a user their recording had holes when it did not.
+    """
+    if missing > 0:
+        return False
+    lowered = text.lower()
+    return any(term in text or term in lowered for term in _GAP_TERMS)
+
+
+def _coerce_recommendations(raw, missing: int = 0) -> list:
     from app.schemas import Recommendation
 
     if not isinstance(raw, list):
@@ -233,10 +264,18 @@ def _coerce_recommendations(raw) -> list:
             continue
         try:
             item.setdefault("priority", index + 1)
-            results.append(Recommendation.model_validate(item))
+            recommendation = Recommendation.model_validate(item)
         except Exception:
             # Drop the malformed entry rather than failing the whole report.
             log.debug("dropping malformed recommendation at index %d", index)
+            continue
+
+        blob = f"{recommendation.title} {recommendation.reason} {recommendation.action}"
+        if _contradicts_coverage(blob, missing):
+            log.info("dropping recommendation that invents missing data: %s",
+                     recommendation.title)
+            continue
+        results.append(recommendation)
     return results
 
 

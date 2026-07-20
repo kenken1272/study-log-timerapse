@@ -7,11 +7,14 @@ UI until it round-trips through these models.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -276,9 +279,38 @@ def _unwrap(value):
     return value
 
 
+def _decode_first(candidate: str):
+    """Decode the first complete JSON value, tolerating trailing content.
+
+    A model that emits a complete answer and then keeps talking — repeating the
+    object, or appending commentary — has still answered. Taking the first
+    complete value is safe; unlike a multi-entry array, the trailing text is not
+    a second distinct answer being discarded. The discard is logged.
+    """
+    decoder = json.JSONDecoder()
+    stripped = candidate.lstrip()
+    value, end = decoder.raw_decode(stripped)
+    remainder = stripped[end:].strip()
+    if remainder:
+        log.warning(
+            "discarded %d characters of trailing content after the JSON value",
+            len(remainder),
+        )
+    return value
+
+
 def parse_model_json(text: str) -> dict:
     """Parse model output, attempting exactly one repair pass on failure."""
+    candidate = extract_json_text(text)
     try:
-        return _unwrap(json.loads(extract_json_text(text)))
+        return _unwrap(json.loads(candidate))
     except json.JSONDecodeError:
-        return _unwrap(json.loads(repair_json_text(text)))
+        pass
+
+    # "Extra data" — a complete value followed by more output — is recoverable.
+    try:
+        return _unwrap(_decode_first(candidate))
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return _unwrap(json.loads(repair_json_text(text)))

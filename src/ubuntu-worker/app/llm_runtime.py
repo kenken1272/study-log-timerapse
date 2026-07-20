@@ -121,6 +121,11 @@ class TransformersLlmRuntime:
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch_dtype,
+            # Required whenever any module lands on CPU. Without it bitsandbytes
+            # refuses the dispatch outright, which made the offload rung fail
+            # for a reason unrelated to memory and denied the larger model its
+            # one real chance of fitting.
+            llm_int8_enable_fp32_cpu_offload=config.cpu_offload,
         )
         kwargs = {"revision": self._revision} if self._revision else {}
 
@@ -155,16 +160,27 @@ class TransformersLlmRuntime:
         log.info("aggregation model loaded in %dms", self.last_load_ms)
 
     def unload(self) -> None:
-        """Return VRAM to the OS so the VLM can have its card back."""
-        if self._model is None:
-            return
+        """Return VRAM to the OS so the VLM can have its card back.
+
+        Runs even when the load itself raised: a failed from_pretrained can
+        leave a partially materialised model holding most of the card, and the
+        next ladder rung would then OOM for the wrong reason.
+        """
+        import sys
+
         import torch
 
         self._model = None
         self._processor = None
         self._loaded_config = None
+        # A live exception keeps its traceback, and the traceback keeps frame
+        # locals — including tensors from the failed load. Clear it explicitly.
+        if hasattr(sys, "last_traceback"):
+            sys.last_traceback = None
+        sys.exc_info()
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize(self._gpu_index)
         log.info("aggregation model unloaded from cuda:%d", self._gpu_index)
 
     # ------------------------------------------------------------------
@@ -209,8 +225,17 @@ class TransformersLlmRuntime:
         text = self._processor.decode(generated, skip_special_tokens=True)
         return text, inference_ms
 
-    def generate(self, ladder: list[LlmConfig], prompt: str) -> LlmOutput:
-        """Walk the ladder until a rung produces parseable JSON."""
+    def generate(
+        self, ladder: list[LlmConfig], prompt: str, validate=None
+    ) -> LlmOutput:
+        """Walk the ladder until a rung produces *usable* JSON.
+
+        `validate` is the schema check. It runs inside the loop on purpose: a
+        rung that returns well-formed JSON with the wrong shape is just as
+        unusable as one that OOMs, and should fall through to the next rung
+        rather than failing the whole aggregation. Observed with the 27B, which
+        parsed cleanly but returned an empty concentration block.
+        """
         last_error: Exception | None = None
         fallback_reason: str | None = None
 
@@ -226,6 +251,8 @@ class TransformersLlmRuntime:
                 text, inference_ms = self._generate_once(config, prompt)
                 peak = max(peak_before, gpu_manager.peak_vram_mib(self._gpu_index))
                 payload = parse_model_json(text)
+                if validate is not None:
+                    validate(payload)
 
                 return LlmOutput(
                     payload=payload,
@@ -246,6 +273,9 @@ class TransformersLlmRuntime:
                 )
             except Exception as error:
                 last_error = error
+                # Drop references to the failed load before anything else.
+                self._model = None
+                self._processor = None
                 if is_oom(error):
                     fallback_reason = (
                         f"CUDA OOM on {config.display_name} "
@@ -288,7 +318,7 @@ class MockLlmRuntime:
     def unload(self) -> None:
         return None
 
-    def generate(self, ladder: list[LlmConfig], prompt: str) -> LlmOutput:
+    def generate(self, ladder: list[LlmConfig], prompt: str, validate=None) -> LlmOutput:
         self.calls += 1
         index = min(self._fail_times, len(ladder) - 1)
         config = ladder[index]
