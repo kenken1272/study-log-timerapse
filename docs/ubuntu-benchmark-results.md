@@ -3,79 +3,99 @@
 Host: slabPCX, 2× NVIDIA TITAN RTX 24GB (sm_75), driver 595.71.05, CUDA 13.2
 Torch: 2.4.1+cu121 · ffmpeg 6.1.1 · Python 3.12.3
 
-## Status
+## Headline results
 
-| Stage | State |
+| | |
 |---|---|
-| Pipeline plumbing (Pub/Sub → queue → frames → GCS → API) | **verified end-to-end** 2026-07-20 |
-| Frame extraction, all four profiles | **measured** |
-| VLM latency / VRAM | **blocked** — model not downloaded (Meta licence) |
-| LLM latency / VRAM / fallback | **blocked** — model not downloaded |
+| VLM adopted | **google/gemma-3-4b-it**, Profile A `original_8`, **19.7s** |
+| VLM rejected | google/gemma-3-12b-it — 28.4s at its *lightest* profile |
+| Compute dtype | **float32** (fp16 is unusable — see below) |
+| Quantization | bitsandbytes NF4 4-bit |
 
-The model numbers below are the ones that decide `VLM_PROFILE` and
-`LLM_GPU_LAYERS`. Until they are measured, the config carries defaults, not
-validated values. Do not treat the defaults as benchmarked.
+## float16 does not work with Gemma 3 on this hardware
 
-## GPU baseline
+The plan called for fp16, correctly reasoning that Turing (sm_75) has no bf16
+path. Measured, fp16 fails outright:
 
-Measured after stopping the pre-existing workloads (see
-[ubuntu-operations.md](ubuntu-operations.md)):
+| compute dtype | logits | generated | decoded |
+|---|---|---|---|
+| float16 | **NaN** (absmax=nan) | 512 tokens (all special) | `''` |
+| float32 | finite, absmax 65.68 | 191 tokens, stops at EOS | valid JSON |
 
-```
-GPU0: 6 MiB / 24576 MiB    compute processes: 0
-GPU1: 204 MiB / 24576 MiB  (Xorg only)
-```
+Gemma 3 is a bf16-native model whose activations overflow fp16's range. Weights
+stay 4-bit NF4; only the compute dtype changes. Every benchmark attempt failed
+identically under fp16, which initially looked like an SLO problem and was not —
+worth remembering, because "all profiles failed" is exactly what a genuinely
+slow model looks like too.
 
-Both cards report `sm_75`. Turing has **no bf16 path**, which is why the VLM
-runs fp16 compute under 4-bit NF4 rather than the bf16 default that most
-Llama-3.2-Vision examples use.
+## VLM: measured, warm, 3 runs each
 
-## Frame extraction (measured)
+| Model | Profile | Resolution | Frames | Extract | Generate | **Total** | Peak VRAM |
+|---|---|---|---:|---:|---:|---:|---:|
+| gemma-3-12b-it | A `original_8` | 1920×1080 | 8 | 2.4s | 29.1s | 32.0–32.5s | 14127 MiB |
+| gemma-3-12b-it | B `reduced_720p_8` | 1280×720 | 8 | 2.5s | 29.4s | 32.4–32.5s | 14127 MiB |
+| gemma-3-12b-it | C `one_third_8` | 640×360 | 8 | 2.5s | 29.3s | 32.1–32.3s | 14127 MiB |
+| gemma-3-12b-it | D `one_third_6` | 640×360 | 6 | 2.5s | 25.8s | 28.4–28.6s | 14127 MiB |
+| **gemma-3-4b-it** | **A `original_8`** | **1920×1080** | **8** | **2.4s** | **16.8s** | **19.7s** | **11677 MiB** |
 
-Synthetic 30s 1920×1080 VP9 chunk, single ffmpeg pass, no re-encode of the
-source. Mac figures shown for comparison; Ubuntu is the one that matters.
+### Downscaling is useless for Gemma 3
 
-| Profile | Frames | Output size | Extract (Ubuntu) | Extract (Mac) |
-|---|---|---|---|---|
-| `original_8` | 8 | 1920×1080 | ~2410–2520 ms | 372 ms |
-| `reduced_720p_8` | 8 | 1280×720 | not yet measured | 366 ms |
-| `one_third_8` | 8 | 640×360 | not yet measured | 361 ms |
-| `one_third_6` | 6 | 640×360 | not yet measured | 354 ms |
+1080p, 720p and 360p all generate in ~29.3s — within noise of each other. Gemma
+3's vision encoder resizes every input to a fixed size and emits a fixed token
+count per image, so input resolution never reaches the model. **Profiles B and C
+do nothing for this model family.** They remain implemented because they are
+correct for architectures that do scale with input resolution, but they must not
+be relied on here.
 
-Sample offsets for `original_8` are 1.88 / 5.62 / 9.38 / 13.12 / 16.88 / 20.62 /
-24.38 / 28.12 s — evenly spaced, none on a boundary.
+Only frame *count* matters: 8→6 frames saved 3.5s, about **1.75s per frame**.
 
-**This is the significant finding so far:** frame extraction alone costs roughly
-**2.4–2.5 s** of the 25 s budget on the real host, about 8× the Mac. Scaling
-barely changed cost on the Mac, which suggests VP9 decode dominates and the
-lighter profiles will save less than their pixel counts imply. If the VLM turns
-out to need more than ~22 s, reducing frame *count* (`one_third_6`) is likely to
-help more than reducing resolution.
+### Why the 12B was rejected rather than tuned
 
-## End-to-end plumbing (measured, mock models)
+Three levers were measured, not assumed:
 
-Four chunks through the real pipeline with `WORKER_DRY_RUN=1`:
+- **Resolution** — no effect at all (above).
+- **Token cap** — not binding. The model emits 191 tokens and stops at EOS, far
+  under the 512 cap, so lowering `max_new_tokens` cannot help. (154ms/token in
+  fp32 is simply what a 12B costs on this card.)
+- **Frame count** — at 1.75s/frame, reaching 25s from 32.0s needs ~4 frames
+  total, which lands *exactly* on the limit and halves temporal coverage of the
+  30s chunk.
+
+The 4B at full 1080p and 8 frames clears the SLO by 5.3s with no quality
+compromise in sampling. That is a better trade than a 12B run at 4 frames.
+
+## Frame extraction
+
+Flat at **~2.4–2.6s regardless of profile** — VP9 decode dominates, and
+downscaling does not reduce it. This is ~12% of the 25s budget and is paid on
+every chunk before the model starts.
+
+## End-to-end plumbing (verified with mock models)
 
 | Stage | Time |
 |---|---|
-| GCS download | 122–767 ms (first includes connection setup) |
-| Frame extraction | 2407–2518 ms |
-| VLM (mock) | 100 ms |
-| Analysis upload | 255–333 ms |
-| **Total** | **2801–3572 ms** |
+| GCS download | 122–767 ms |
+| Frame extraction | 2407–2631 ms |
+| Analysis upload | 89–333 ms |
+| Non-model overhead | **~3.0–3.5s** |
 
-Non-model overhead is therefore about **3.0–3.5 s**, leaving roughly **21.5 s**
-for real inference inside the 25 s SLO.
+Verified in the same run: duplicate Pub/Sub delivery produced no second
+analysis; out-of-order arrival (3,1,2) was reassembled in timeline order; the
+worker's own `analysis/` writes were ignored; session end triggered exactly one
+final aggregation; `coverage_ratio` and the gap warning were computed from the
+real span rather than taken from the model.
 
-Verified in the same run:
+## Caveat on quality
 
-- duplicate Pub/Sub delivery with an identical generation produced no second
-  analysis
-- chunks uploaded out of order (3, 1, 2) were reassembled in timeline order
-- the worker's own writes under `analysis/` were ignored, not re-ingested
-- session end via `metadata.json` triggered exactly one final aggregation
-- `coverage_ratio` 0.571 and a Japanese gap warning were generated from the
-  real span, not from the model's own claim
+The benchmark chunk is an ffmpeg `testsrc` colour-bar pattern, **not real study
+footage**. Timing and VRAM figures are valid; the quality comparison is not.
+For the record, on this synthetic input the 12B claimed "人物の存在は確認できる"
+(a person is present) when no person exists in a colour-bar pattern, while the
+4B described it accurately as a test screen. That is a single sample of
+synthetic data and is not evidence that the 4B is the better analyst — real
+footage is needed before saying anything about quality.
+
+## LLM
 
 ## To run the real benchmarks
 
