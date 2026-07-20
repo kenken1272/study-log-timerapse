@@ -50,6 +50,13 @@ const UPLOAD_DRAIN_TIMEOUT_MS = 15_000;
 // Give up a backlog sweep after this many transient failures in a row.
 const MAX_CONSECUTIVE_UPLOAD_FAILURES = 3;
 const MIN_CHUNK_DURATION_MS = 1_000;
+// Cap the capture bitrate. Left unset, browsers default to roughly 2.5Mbit/s at
+// 1280x720, producing ~9.3MB per 30s chunk — measured at ~109s to upload on a
+// ~85KB/s link, so uploads could never keep pace with recording and the backlog
+// grew without bound. 600kbit/s gives ~2.2MB per chunk (~26s on the same link).
+// The timelapse is downscaled to 1280 wide and sped up 30-120x, so the loss of
+// detail is not visible in the finished artefact.
+const VIDEO_BITS_PER_SECOND = 600_000;
 
 type SessionResponse = {
   session: JsonStudySession;
@@ -688,7 +695,10 @@ function CameraRecorderInner() {
   function startStandaloneChunkRecorder(stream: MediaStream, mimeType: string) {
     const chunks: Blob[] = [];
     const startedAtMs = Date.now();
-    const recorder = new MediaRecorder(stream, { mimeType });
+    const recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: VIDEO_BITS_PER_SECOND,
+    });
     recorderRef.current = recorder;
 
     recorder.ondataavailable = (event) => {
