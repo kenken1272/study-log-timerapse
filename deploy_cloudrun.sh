@@ -138,9 +138,14 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --role="roles/datastore.user" \
   --quiet
 
+# --condition=None is required because the bucket policy now contains a
+# conditional binding (the Ubuntu worker's .json-scoped objectAdmin). Without
+# it gcloud refuses to add an unconditioned binding non-interactively, and the
+# deploy aborts before it ever reaches "gcloud run deploy".
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" \
+  --condition=None \
   --project="$PROJECT_ID" \
   --quiet
 
