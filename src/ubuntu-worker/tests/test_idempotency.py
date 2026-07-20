@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.queue_db import STATE_COMPLETED, STATE_RECEIVED
-from tests.conftest import make_ref
+from helpers import make_ref
 
 
 def test_duplicate_delivery_is_ignored(db):

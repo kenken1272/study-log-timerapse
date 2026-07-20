@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -118,26 +119,40 @@ class QueueDB:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), timeout=30.0, isolation_level=None)
+        # The connection is shared by the Pub/Sub callback threads, the chunk
+        # loop and the window loop, so it must outlive its creating thread.
+        # Safety comes from _lock below, not from sqlite3's own thread check.
+        self._conn = sqlite3.connect(
+            str(self.path), timeout=30.0, isolation_level=None, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        # Reentrant: write helpers call read helpers while already holding it.
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._conn
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-        else:
-            self._conn.execute("COMMIT")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
+
+    def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        """Serialised read. Every read goes through here for thread safety."""
+        with self._lock:
+            return list(self._conn.execute(sql, params))
 
     # ------------------------------------------------------------------
     # Ingest
@@ -279,9 +294,8 @@ class QueueDB:
         return STATE_RETRY_WAIT
 
     def get(self, key: str) -> sqlite3.Row | None:
-        return self._conn.execute(
-            "SELECT * FROM chunks WHERE idempotency_key=?", (key,)
-        ).fetchone()
+        rows = self._query("SELECT * FROM chunks WHERE idempotency_key=?", (key,))
+        return rows[0] if rows else None
 
     def recover_in_flight(self) -> int:
         """Rewind chunks abandoned by a previous process back to RECEIVED."""
@@ -305,41 +319,37 @@ class QueueDB:
         at 0, so ordering is (segment, chunk) with GCS creation time only as a
         tiebreak for re-uploads of the same slot.
         """
-        return list(
-            self._conn.execute(
-                """
-                SELECT * FROM chunks
-                 WHERE session_id=? AND state=?
-                 ORDER BY segment_index ASC, chunk_index ASC,
-                          COALESCE(gcs_time_created, '') ASC
-                """,
-                (session_id, STATE_COMPLETED),
-            )
+        return self._query(
+            """
+            SELECT * FROM chunks
+             WHERE session_id=? AND state=?
+             ORDER BY segment_index ASC, chunk_index ASC,
+                      COALESCE(gcs_time_created, '') ASC
+            """,
+            (session_id, STATE_COMPLETED),
         )
 
     def pending_count_for_session(self, session_id: str) -> int:
-        row = self._conn.execute(
+        rows = self._query(
             f"""
             SELECT COUNT(*) AS n FROM chunks
              WHERE session_id=? AND state NOT IN ({','.join('?' * len(TERMINAL_STATES))})
             """,
             (session_id, *TERMINAL_STATES),
-        ).fetchone()
-        return int(row["n"])
+        )
+        return int(rows[0]["n"])
 
     def session_counts(self, session_id: str) -> dict[str, int]:
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT state, COUNT(*) AS n FROM chunks WHERE session_id=? GROUP BY state",
             (session_id,),
-        ).fetchall()
+        )
         counts = {row["state"]: int(row["n"]) for row in rows}
         counts["TOTAL"] = sum(counts.values())
         return counts
 
     def active_sessions(self) -> list[sqlite3.Row]:
-        return list(
-            self._conn.execute("SELECT * FROM sessions WHERE finalized=0")
-        )
+        return self._query("SELECT * FROM sessions WHERE finalized=0")
 
     def mark_session_ended(self, session_id: str, ended_at: float) -> None:
         with self._tx() as conn:
@@ -412,12 +422,10 @@ class QueueDB:
             )
 
     def completed_aggregations(self, session_id: str) -> list[sqlite3.Row]:
-        return list(
-            self._conn.execute(
-                "SELECT * FROM aggregations WHERE session_id=? AND state=? "
-                "ORDER BY window_start ASC",
-                (session_id, "DONE"),
-            )
+        return self._query(
+            "SELECT * FROM aggregations WHERE session_id=? AND state=? "
+            "ORDER BY window_start ASC",
+            (session_id, "DONE"),
         )
 
     # ------------------------------------------------------------------
@@ -433,10 +441,8 @@ class QueueDB:
             )
 
     def get_meta(self, key: str, default: str | None = None) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key=?", (key,)
-        ).fetchone()
-        return row["value"] if row else default
+        rows = self._query("SELECT value FROM meta WHERE key=?", (key,))
+        return rows[0]["value"] if rows else default
 
 
 def window_key(session_id: str, window_start: datetime) -> str:

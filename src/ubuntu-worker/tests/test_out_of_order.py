@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.queue_db import STATE_COMPLETED
-from tests.conftest import make_ref, rows_as_tuples
+from helpers import make_ref, rows_as_tuples
 
 
 def _complete(db, segment, chunk, generation="1", time_created=None):

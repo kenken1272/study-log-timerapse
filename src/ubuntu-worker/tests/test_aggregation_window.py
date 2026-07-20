@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from app import aggregator
 from app.queue_db import STATE_COMPLETED, final_key, window_key
-from tests.conftest import make_ref
+from helpers import make_ref
 
 BASE = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
 

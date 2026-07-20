@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 from app.queue_db import STATE_DEAD_LETTER, STATE_RETRY_WAIT
-from tests.conftest import make_ref
+from helpers import make_ref
 
 
 def test_transient_failure_schedules_a_future_retry(db):

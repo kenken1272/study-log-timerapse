@@ -75,7 +75,9 @@ gcloud pubsub topics describe "${DEAD_LETTER_TOPIC}" --project "${PROJECT_ID}" >
   || apply gcloud pubsub topics create "${DEAD_LETTER_TOPIC}" --project "${PROJECT_ID}"
 
 log "granting GCS permission to publish"
-GCS_SA="$(gcloud storage service-agent --project "${PROJECT_ID}")"
+# The command emits surrounding whitespace, which makes the IAM member string
+# invalid and produces a misleading "service account does not exist" error.
+GCS_SA="$(gcloud storage service-agent --project "${PROJECT_ID}" | tr -d '[:space:]')"
 apply gcloud pubsub topics add-iam-policy-binding "${TOPIC}" \
   --project "${PROJECT_ID}" \
   --member="serviceAccount:${GCS_SA}" \

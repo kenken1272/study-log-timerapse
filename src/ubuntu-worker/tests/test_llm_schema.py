@@ -55,6 +55,14 @@ def test_produces_a_valid_report():
     assert analysis.runtime.requested_model == "Meta-Llama-3-70B-Instruct-Q2_K"
 
 
+def test_dry_run_output_never_claims_the_real_model_ran():
+    # A dry-run artefact must be distinguishable from a genuine analysis, or a
+    # mock report sitting in GCS reads as a real one.
+    analysis = aggregator.build_analysis(make_plan(), make_payloads(60), MockLlmRuntime(), LADDER)
+    assert analysis.runtime.used_model.startswith("mock-llm")
+    assert analysis.runtime.quantization == "none"
+
+
 def test_coverage_is_computed_locally_not_taken_from_the_model():
     # The model is not trusted to report how complete its own input was.
     analysis = aggregator.build_analysis(make_plan(), make_payloads(30), MockLlmRuntime(), LADDER)

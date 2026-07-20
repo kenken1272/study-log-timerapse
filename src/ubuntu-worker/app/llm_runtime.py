@@ -240,8 +240,10 @@ class MockLlmRuntime:
             },
             runtime=LlmRuntimeInfo(
                 requested_model=ladder[0].display_name,
-                used_model=config.display_name,
-                quantization=config.quantization,
+                # Never claim the real model ran. A dry-run report must be
+                # distinguishable from a genuine one at a glance.
+                used_model=f"mock-llm ({config.display_name})",
+                quantization="none",
                 fallback_used=index > 0,
                 fallback_reason="mock fallback" if index > 0 else None,
                 context_size=config.context_size,
