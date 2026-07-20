@@ -16,13 +16,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app import aggregator, gpu_manager, result_store, video_frames
+from app import aggregator, cuda_health, gpu_manager, result_store, video_frames
 from app.gcs_client import ChunkGone, GcsClient, is_transient
 from app.health import HealthServer
 from app.llm_runtime import (
     LlmConfig,
     MockLlmRuntime,
-    TransformersLlmRuntime,
+    SubprocessLlmRuntime,
     build_fallback_ladder,
 )
 from app.logging_config import configure as configure_logging
@@ -60,7 +60,10 @@ class Worker:
         self.db = QueueDB(settings.db_path)
         self.gcs = GcsClient(settings.project_id, settings.bucket_name)
         self.vlm = build_runtime(settings)
-        self.llm = MockLlmRuntime() if settings.dry_run else TransformersLlmRuntime(
+        # Out of process on purpose: it is the only way the ~11GB actually
+        # comes back on GPU1, and it keeps a CUDA fault in the aggregation
+        # model away from the resident VLM's context.
+        self.llm = MockLlmRuntime() if settings.dry_run else SubprocessLlmRuntime(
             gpu_index=settings.llm_gpu,
             revision=settings.llm_revision,
             compute_dtype=settings.llm_compute_dtype,
@@ -74,6 +77,7 @@ class Worker:
         self._consumer: PubSubConsumer | None = None
         self._health: HealthServer | None = None
         self._last_chunk_ms = 0
+        self._fatal_cuda: Exception | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,6 +153,8 @@ class Worker:
 
     def _chunk_loop(self) -> None:
         while not self._stop.is_set():
+            if self._fatal_cuda is not None:
+                raise self._fatal_cuda
             row = self.db.claim_next()
             if row is None:
                 self._wake.wait(timeout=IDLE_SLEEP_SEC)
@@ -156,6 +162,8 @@ class Worker:
                 continue
             try:
                 self._process_chunk(row)
+            except cuda_health.FatalCudaError:
+                raise
             except Exception:
                 log.exception("unhandled error processing %s", row["idempotency_key"])
                 self.db.fail(
@@ -206,6 +214,15 @@ class Worker:
             self._retry(key, error, "vlm_schema")
             return
         except Exception as error:
+            if cuda_health.is_fatal_cuda_error(error):
+                # Says nothing about this chunk — the context is dead and every
+                # further CUDA call in this process would fail identically.
+                # Put it back without penalty and let a new process retry it.
+                self.db.requeue_without_penalty(
+                    key, f"fatal CUDA error during VLM: {error}"
+                )
+                self._publish_status(row["uid"], row["session_id"], state="processing")
+                cuda_health.raise_if_fatal(error)
             self._retry(key, error, "vlm")
             return
         self.db.set_state(key, STATE_VLM_DONE)
@@ -322,6 +339,13 @@ class Worker:
         while not self._stop.wait(WINDOW_CHECK_INTERVAL_SEC):
             try:
                 self._tick_windows()
+            except cuda_health.FatalCudaError as error:
+                # This thread cannot exit the process on its own; hand it to the
+                # main loop, which owns the exit path.
+                self._fatal_cuda = error
+                self._stop.set()
+                self._wake.set()
+                return
             except Exception:
                 log.exception("window loop iteration failed")
 
@@ -351,44 +375,97 @@ class Worker:
         return session.get("status") in ("ready", "failed")
 
     def _finalize_session(self, uid: str, session_id: str) -> None:
+        """Finalise a session, but only once there is something to finalise.
+
+        Session end arrives by its own path (metadata.json) and can easily be
+        seen *before* the chunk notifications, or before any chunk has finished
+        inference. The previous version treated "no analysable chunks" as a
+        finished outcome: it set finalized=1 and published a failure, so chunks
+        completing seconds later could never produce a report. Finalisation is
+        now a request that waits for the work, not a verdict on it.
+        """
+        counts = self.db.session_counts(session_id)
+        completed = counts.get(STATE_COMPLETED, 0)
         pending = self.db.pending_count_for_session(session_id)
-        if pending:
-            row = self.db._conn.execute(  # noqa: SLF001 - internal read is intentional
-                "SELECT ended_at FROM sessions WHERE session_id=?", (session_id,)
-            ).fetchone()
-            first_seen = row["ended_at"] if row and row["ended_at"] else None
-            if first_seen is None:
-                self.db.mark_session_ended(session_id, time.time())
-                log.info(
-                    "session %s ended with %d chunks in flight; waiting up to %ds",
-                    session_id, pending, self.settings.session_end_grace_sec,
+        expected = self._expected_chunk_count(uid, session_id)
+
+        requested_at = self.db.finalization_requested_at(session_id)
+        if requested_at is None:
+            self.db.mark_session_ended(session_id, time.time())
+            requested_at = time.time()
+            log.info(
+                "session %s end requested (completed=%d pending=%d expected=%s)",
+                session_id, completed, pending, expected,
+            )
+
+        waited = time.time() - requested_at
+        within_grace = waited < self.settings.session_end_grace_sec
+
+        incomplete = pending > 0 or (expected is not None and completed < expected)
+        if completed == 0 or (incomplete and within_grace):
+            # Never finalise on nothing, and give in-flight work its grace.
+            log.info(
+                "session %s waiting for chunks (completed=%d pending=%d "
+                "expected=%s waited=%.0fs)",
+                session_id, completed, pending, expected, waited,
+            )
+            self._publish_status(
+                uid, session_id,
+                state="processing" if completed else "queued",
+                message="チャンクの分析完了を待っています。",
+            )
+            if completed == 0 and waited > self.settings.session_end_grace_sec * 10:
+                # Nothing ever arrived. Say so rather than waiting forever.
+                log.error(
+                    "session %s produced no analysable chunks after %.0fs",
+                    session_id, waited,
                 )
-                return
-            if time.time() - first_seen < self.settings.session_end_grace_sec:
-                return
+                self._publish_status(
+                    uid, session_id, state="failed",
+                    message="分析できたチャンクがありませんでした。",
+                )
+            return
+
+        if incomplete:
             log.warning(
-                "grace period elapsed for %s with %d chunks unfinished; "
-                "finalising with recorded gaps", session_id, pending,
+                "grace elapsed for %s: finalising with %d of %s chunks "
+                "(pending=%d); gaps are recorded in the report",
+                session_id, completed, expected, pending,
             )
 
         plan = aggregator.plan_final(self.db, session_id, uid)
         if plan is None:
-            log.warning("session %s ended with no analysable chunks", session_id)
-            self.db.mark_session_finalized(session_id)
-            self._publish_status(uid, session_id, state="failed",
-                                 message="分析できたチャンクがありませんでした。")
+            # completed > 0 said otherwise, so this is a real inconsistency.
+            log.error("session %s: completed=%d but no final plan could be built",
+                      session_id, completed)
             return
 
+        # finalized=1 only after a valid analysis is actually stored.
         if self._run_aggregation(plan):
             self.db.mark_session_finalized(session_id)
             self._publish_status(uid, session_id, state="ready")
+        else:
+            self._publish_status(
+                uid, session_id, state="partial",
+                message="統合分析を再試行しています。",
+            )
+
+    def _expected_chunk_count(self, uid: str, session_id: str) -> int | None:
+        """How many chunks the app says this session recorded, if it says."""
+        metadata = self.gcs.read_json(
+            f"{result_store.session_prefix(uid, session_id)}metadata.json"
+        )
+        session = (metadata or {}).get("session") or {}
+        value = session.get("chunkCount")
+        return int(value) if isinstance(value, int) and value >= 0 else None
 
     def _run_aggregation(self, plan: aggregator.WindowPlan) -> bool:
         if not self.db.claim_aggregation(
             plan.aggregation_key, plan.session_id, plan.uid, plan.analysis_type,
             plan.start.isoformat(), plan.end.isoformat(),
         ):
-            log.debug("aggregation %s already done", plan.aggregation_key)
+            log.debug("aggregation %s not claimable (done, running or exhausted)",
+                      plan.aggregation_key)
             return False
 
         log.info(
@@ -399,6 +476,23 @@ class Worker:
 
         try:
             payloads = self._load_chunk_payloads(plan)
+            if not payloads:
+                # Loading a 12B model to summarise nothing is pure waste, and
+                # retrying it every minute is how three sessions burned ~100
+                # GPU loads each. Wait for the chunks instead.
+                log.warning(
+                    "aggregation %s has no completed chunk analyses yet; waiting",
+                    plan.aggregation_key,
+                )
+                self.db.defer_aggregation(
+                    plan.aggregation_key, "WAITING_FOR_CHUNKS",
+                    "分析済みチャンクがまだありません。",
+                )
+                self._publish_status(
+                    plan.uid, plan.session_id, state="processing",
+                    message="チャンクの分析完了を待っています。",
+                )
+                return False
             ladder = self._build_ladder()
             with self.gpu_lock.acquire(timeout=1800):
                 analysis = aggregator.build_analysis(plan, payloads, self.llm, ladder)
@@ -410,6 +504,13 @@ class Worker:
             )
             return True
         except Exception as error:
+            if cuda_health.is_fatal_cuda_error(error):
+                # Reset to FAILED (retryable) rather than burning an attempt on
+                # a failure that had nothing to do with this window.
+                self.db.finish_aggregation(
+                    plan.aggregation_key, "FAILED", f"fatal CUDA error: {error}"
+                )
+                cuda_health.raise_if_fatal(error)
             log.exception("aggregation %s failed", plan.aggregation_key)
             self.db.finish_aggregation(plan.aggregation_key, "FAILED", str(error))
             self._publish_status(plan.uid, plan.session_id, state="partial",
@@ -541,6 +642,13 @@ def main() -> int:
 
     try:
         worker.start()
+    except cuda_health.FatalCudaError as error:
+        # Exit non-zero so systemd restarts us with a fresh CUDA context. The
+        # queue is durable, so nothing is lost — the alternative is what
+        # happened in production: a poisoned process that stayed up for two
+        # hours failing 822 times.
+        log.critical("exiting on fatal CUDA error: %s", error)
+        return cuda_health.FATAL_CUDA_EXIT_CODE
     finally:
         worker.cleanup()
     return 0

@@ -15,11 +15,16 @@ nothing but special tokens. fp32 compute is the configuration that works.
 from __future__ import annotations
 
 import gc
+import json
 import logging
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from app import gpu_manager
+from app.cuda_health import FATAL_CUDA_EXIT_CODE
 from app.schemas import LlmRuntime as LlmRuntimeInfo
 from app.schemas import parse_model_json
 
@@ -360,3 +365,80 @@ class MockLlmRuntime:
                 peak_vram_mib=0,
             ),
         )
+
+
+class SubprocessLlmRuntime:
+    """Runs each aggregation in a short-lived child process.
+
+    Same interface as TransformersLlmRuntime, so aggregator.build_analysis does
+    not know the difference. The child does the model work and dies, which is
+    what makes the VRAM come back and what keeps a CUDA fault out of the
+    parent's context — see tools/aggregate_once.py for the measurements that
+    motivated this.
+    """
+
+    def __init__(self, gpu_index: int, revision: str | None = None,
+                 compute_dtype: str = DEFAULT_COMPUTE_DTYPE,
+                 python_executable: str | None = None,
+                 timeout_sec: float = 1800.0) -> None:
+        self._gpu_index = gpu_index
+        self._revision = revision
+        self.compute_dtype = compute_dtype
+        self._python = python_executable or sys.executable
+        self._timeout = timeout_sec
+
+    def unload(self) -> None:
+        # Nothing is resident between calls; the child already exited.
+        return None
+
+    def generate(self, ladder: list[LlmConfig], prompt: str, validate=None) -> LlmOutput:
+        from dataclasses import asdict
+
+        job = json.dumps({
+            "prompt": prompt,
+            "gpu_index": self._gpu_index,
+            "compute_dtype": self.compute_dtype,
+            "revision": self._revision,
+            "ladder": [asdict(rung) for rung in ladder],
+        })
+
+        worker_root = Path(__file__).resolve().parent.parent
+        started = time.perf_counter()
+        process = subprocess.run(
+            [self._python, "-m", "tools.aggregate_once"],
+            input=job,
+            capture_output=True,
+            text=True,
+            cwd=str(worker_root),
+            timeout=self._timeout,
+        )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        if process.returncode == FATAL_CUDA_EXIT_CODE:
+            # Contained: the child's context died, not ours. The VLM in this
+            # process is untouched and keeps serving chunks.
+            log.error(
+                "aggregation subprocess hit a fatal CUDA error (contained, "
+                "the resident VLM is unaffected): %s", process.stderr.strip()[:300]
+            )
+            raise LlmFailed(f"fatal CUDA error in aggregation subprocess: "
+                            f"{process.stderr.strip()[:300]}")
+        if process.returncode != 0:
+            raise LlmFailed(
+                f"aggregation subprocess exited {process.returncode}: "
+                f"{process.stderr.strip()[:400]}"
+            )
+
+        try:
+            result = json.loads(process.stdout)
+        except json.JSONDecodeError as error:
+            raise LlmFailed(f"aggregation subprocess returned no JSON: {error}") from error
+
+        payload = result["payload"]
+        if validate is not None:
+            validate(payload)
+
+        runtime = LlmRuntimeInfo.model_validate(result["runtime"])
+        log.info("aggregation subprocess completed in %dms (model=%s fallback=%s)",
+                 elapsed_ms, runtime.used_model, runtime.fallback_used)
+        return LlmOutput(payload=payload, runtime=runtime)

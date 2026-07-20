@@ -33,6 +33,11 @@ STATE_DEAD_LETTER = "DEAD_LETTER"
 
 TERMINAL_STATES = (STATE_COMPLETED, STATE_DEAD_LETTER)
 
+# An aggregation that keeps failing must eventually stop asking for a GPU.
+# Counts every attempt including the first, so the ceiling is honest.
+MAX_AGGREGATION_ATTEMPTS = 8
+AGGREGATION_MAX_BACKOFF_SEC = 3600.0
+
 # States that mean "a previous process was mid-flight and died". On startup
 # these are rewound to RECEIVED so the work restarts from a clean point.
 IN_FLIGHT_STATES = (
@@ -90,6 +95,7 @@ CREATE TABLE IF NOT EXISTS aggregations (
   window_end      TEXT,
   state           TEXT NOT NULL,
   attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at REAL NOT NULL DEFAULT 0,
   error_message   TEXT,
   created_at      REAL NOT NULL,
   updated_at      REAL NOT NULL
@@ -130,8 +136,25 @@ class QueueDB:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         # Reentrant: write helpers call read helpers while already holding it.
         self._lock = threading.RLock()
+
+    def _migrate(self) -> None:
+        """Additive migrations for databases created by an earlier version.
+
+        CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+        so new columns have to be added explicitly or an upgrade in place would
+        fail on live data.
+        """
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(aggregations)")
+        }
+        if "next_attempt_at" not in columns:
+            self._conn.execute(
+                "ALTER TABLE aggregations ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -261,6 +284,28 @@ class QueueDB:
                 (key, previous["state"] if previous else None, state, now),
             )
 
+    def requeue_without_penalty(self, key: str, reason: str) -> None:
+        """Return a chunk to the queue without consuming one of its attempts.
+
+        For failures that say nothing about the chunk — a poisoned CUDA context
+        being the case that motivated this. Counting those as attempts burned
+        all five retries of four healthy chunks against a dead context and
+        dead-lettered work that was never broken.
+        """
+        now = _now()
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE chunks SET state=?, attempts=MAX(attempts-1, 0),"
+                " next_attempt_at=?, error_class=?, error_message=?, updated_at=?"
+                " WHERE idempotency_key=?",
+                (STATE_RECEIVED, 0, "fatal_cuda", reason[:2000], now, key),
+            )
+            conn.execute(
+                "INSERT INTO transitions (idempotency_key, from_state, to_state, at)"
+                " VALUES (?,?,?,?)",
+                (key, None, STATE_RECEIVED, now),
+            )
+
     def fail(
         self,
         key: str,
@@ -358,6 +403,15 @@ class QueueDB:
                 (ended_at, session_id),
             )
 
+    def finalization_requested_at(self, session_id: str) -> float | None:
+        """When session end was first observed, or None if it has not been."""
+        rows = self._query(
+            "SELECT ended_at FROM sessions WHERE session_id=?", (session_id,)
+        )
+        if not rows or rows[0]["ended_at"] is None:
+            return None
+        return float(rows[0]["ended_at"])
+
     def mark_session_finalized(self, session_id: str) -> None:
         with self._tx() as conn:
             conn.execute(
@@ -372,16 +426,23 @@ class QueueDB:
         analysis_type: str,
         window_start: str | None,
         window_end: str | None,
+        max_attempts: int = MAX_AGGREGATION_ATTEMPTS,
     ) -> bool:
-        """Reserve an aggregation unit. False means someone already produced it."""
+        """Reserve an aggregation unit.
+
+        False means: already produced, currently running, still backing off, or
+        given up on. The backoff and the ceiling both matter — without them a
+        failing window retried every 60s forever, loading a 12B model each time.
+        """
         now = _now()
         with self._tx() as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO aggregations (
                   aggregation_key, session_id, uid, analysis_type,
-                  window_start, window_end, state, attempts, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,0,?,?)
+                  window_start, window_end, state, attempts,
+                  next_attempt_at, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,1,0,?,?)
                 """,
                 (
                     aggregation_key,
@@ -397,28 +458,70 @@ class QueueDB:
             )
             if cursor.rowcount > 0:
                 return True
-            # Already exists — only retry if a previous attempt failed.
+
             row = conn.execute(
-                "SELECT state FROM aggregations WHERE aggregation_key=?",
+                "SELECT state, attempts, next_attempt_at FROM aggregations"
+                " WHERE aggregation_key=?",
                 (aggregation_key,),
             ).fetchone()
-            if row and row["state"] == "FAILED":
-                conn.execute(
-                    "UPDATE aggregations SET state=?, attempts=attempts+1, updated_at=?"
-                    " WHERE aggregation_key=?",
-                    ("RUNNING", now, aggregation_key),
-                )
-                return True
-            return False
+            if row is None:
+                return False
+            if row["state"] not in ("FAILED", "WAITING_FOR_CHUNKS"):
+                return False
+            if (row["next_attempt_at"] or 0) > now:
+                return False
+            if row["attempts"] >= max_attempts:
+                if row["state"] != "DEAD_LETTER":
+                    conn.execute(
+                        "UPDATE aggregations SET state=?, updated_at=?"
+                        " WHERE aggregation_key=?",
+                        ("DEAD_LETTER", now, aggregation_key),
+                    )
+                return False
+
+            conn.execute(
+                "UPDATE aggregations SET state=?, attempts=attempts+1, updated_at=?"
+                " WHERE aggregation_key=?",
+                ("RUNNING", now, aggregation_key),
+            )
+            return True
+
+    def defer_aggregation(self, aggregation_key: str, state: str, reason: str) -> None:
+        """Park an aggregation with exponential backoff instead of hot-looping."""
+        now = _now()
+        row = self._query(
+            "SELECT attempts FROM aggregations WHERE aggregation_key=?",
+            (aggregation_key,),
+        )
+        attempts = row[0]["attempts"] if row else 0
+        delay = min(60.0 * (2 ** min(attempts, 6)), AGGREGATION_MAX_BACKOFF_SEC)
+        delay = random.uniform(delay / 2, delay)
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE aggregations SET state=?, error_message=?, next_attempt_at=?,"
+                " updated_at=? WHERE aggregation_key=?",
+                (state, reason[:2000], now + delay, now, aggregation_key),
+            )
 
     def finish_aggregation(
         self, aggregation_key: str, state: str, error: str | None = None
     ) -> None:
+        now = _now()
+        next_attempt = 0.0
+        if state == "FAILED":
+            row = self._query(
+                "SELECT attempts FROM aggregations WHERE aggregation_key=?",
+                (aggregation_key,),
+            )
+            attempts = row[0]["attempts"] if row else 0
+            delay = min(60.0 * (2 ** min(attempts, 6)), AGGREGATION_MAX_BACKOFF_SEC)
+            next_attempt = now + random.uniform(delay / 2, delay)
         with self._tx() as conn:
             conn.execute(
-                "UPDATE aggregations SET state=?, error_message=?, updated_at=?"
-                " WHERE aggregation_key=?",
-                (state, error[:2000] if error else None, _now(), aggregation_key),
+                "UPDATE aggregations SET state=?, error_message=?, next_attempt_at=?,"
+                " updated_at=? WHERE aggregation_key=?",
+                (state, error[:2000] if error else None, next_attempt, now,
+                 aggregation_key),
             )
 
     def completed_aggregations(self, session_id: str) -> list[sqlite3.Row]:
