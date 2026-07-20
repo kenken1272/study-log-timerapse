@@ -129,6 +129,46 @@ kill -TERM <PID>
 Never use `killall python` or a broad `pkill -f python` on this host — it runs
 other people's research jobs.
 
+## Fatal CUDA errors
+
+Some CUDA errors are sticky: once raised, every subsequent CUDA call in that
+process fails identically, **on every device**. On 2026-07-20 a single Xid 13
+(misaligned address) on GPU1 during aggregation was followed two seconds later
+by the VLM failing on GPU0 with valid input. The worker retried in the same
+process, so four healthy chunks burned all five attempts against a dead context
+and were dead-lettered, and three aggregations failed 822 times over two hours.
+Re-run in a fresh process, those chunks succeeded on the first attempt.
+
+The worker now exits with code 70 on such an error and systemd restarts it with
+a fresh context. Expected and healthy behaviour:
+
+```bash
+journalctl --user -u study-timelapse-worker | grep -i "fatal CUDA"
+systemctl --user show study-timelapse-worker -p NRestarts
+```
+
+Chunks interrupted this way are requeued **without** consuming an attempt —
+a poisoned context says nothing about the chunk it happened to interrupt.
+
+If restarts are frequent (more than a few per day), that is a real signal:
+check `journalctl -k | grep Xid` and treat repeated Xid 13 as a hardware or
+driver issue rather than something the retry logic should absorb.
+
+### Recovering chunks dead-lettered by a context failure
+
+They are identifiable and safe to requeue, but do it per session, never in
+bulk, and archive the history first:
+
+```sql
+-- inspect
+SELECT session_id, COUNT(*) FROM chunks
+ WHERE state='DEAD_LETTER' AND error_message LIKE '%misaligned address%'
+ GROUP BY session_id;
+```
+
+The source WebM must still exist in GCS — beyond `CHUNK_CLEANUP_DELAY_SEC`
+(24h) it will not, and those chunks are unrecoverable.
+
 ## Services stopped for this pipeline
 
 The GPUs were freed on 2026-07-20. Nothing was uninstalled or deleted; the
