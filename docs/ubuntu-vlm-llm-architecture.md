@@ -146,8 +146,18 @@ checked.
 
 - The bucket stays private. Analysis is read server-side and returned as JSON;
   no object is ever made public.
-- The worker's service account gets subscribe + object read + object create.
-  **No delete permission** — it can never remove a user's footage.
+- The worker authenticates with **ADC** on the Ubuntu host
+  (`~/.config/gcloud/application_default_credentials.json`, mode 600, quota
+  project `vla-test1`). No key file is copied, displayed, or committed.
+- **Caveat worth knowing:** ADC belongs to a human account, so the worker
+  inherits that account's permissions — including the ability to delete bucket
+  objects. The original design put a least-privilege service account here
+  (`study-timelapse-worker@`, subscribe + object read + object create, no
+  delete), and that account still exists unused. With ADC, nothing at the IAM
+  layer prevents the worker from destroying a user's footage; the only thing
+  that does is the absence of any delete call in the code, enforced by
+  `tests/test_no_delete_capability.py`. Switching back to the service account
+  restores defence in depth.
 - Spooled video is written with `umask 077` and deleted as soon as its analysis
   is safely in GCS.
 - Object names contain a uid and are logged at DEBUG only. Log output is passed

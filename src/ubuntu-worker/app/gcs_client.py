@@ -1,8 +1,13 @@
 """Thin GCS wrapper.
 
-Scope is deliberately narrow: read chunks, write analysis JSON. This worker's
-service account has no delete permission on the bucket, and nothing here
-attempts one.
+Scope is deliberately narrow: read chunks, write analysis JSON. There is no
+delete path anywhere in this module, and tests/test_no_delete_capability.py
+enforces that.
+
+That test matters more than it looks: the worker authenticates with ADC
+belonging to a human account, which can almost certainly delete bucket objects.
+The IAM layer therefore does not stop us from destroying a user's footage — only
+the absence of a delete call does.
 """
 
 from __future__ import annotations

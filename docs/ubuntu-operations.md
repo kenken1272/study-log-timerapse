@@ -143,6 +143,27 @@ Exact recorded state, including full argv:
 Neither the conda environments nor any model weights for these projects were
 touched.
 
+## Authentication
+
+The worker uses **ADC** at `~/.config/gcloud/application_default_credentials.json`
+(mode 600, owned by `suzukilab`, quota project `vla-test1`). `worker.env`
+deliberately does not set `GOOGLE_APPLICATION_CREDENTIALS`.
+
+Verify:
+
+```bash
+gcloud auth application-default print-access-token >/dev/null && echo ok
+```
+
+If the worker starts logging 401/403 from GCS or Pub/Sub, ADC has expired or
+been revoked — re-run `gcloud auth application-default login` on the host.
+
+A least-privilege service account, `study-timelapse-worker@vla-test1`, exists
+with subscribe + object read + object create and **no** delete. It is currently
+unused. Moving the worker onto it (set `GOOGLE_APPLICATION_CREDENTIALS`, or use
+Workload Identity Federation) removes the risk that a bug could delete a user's
+footage, which ADC from a human account does not prevent.
+
 ## Things that need a human
 
 These cannot be done non-interactively and are deliberately not automated:
@@ -151,7 +172,7 @@ These cannot be done non-interactively and are deliberately not automated:
 - `sudo loginctl enable-linger suzukilab` — needed for the worker to survive
   logout
 - Meta model licence acceptance on Hugging Face, and `huggingface-cli login`
-- Any first-time `gcloud auth application-default login`
+- Re-running `gcloud auth application-default login` when ADC expires
 
 Never paste a token or password into a command that gets logged, into source, or
 into a chat transcript.
