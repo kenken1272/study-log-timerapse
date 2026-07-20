@@ -255,6 +255,9 @@ const runtimeKeys = [
   "CLOUD_RUN_SERVICE_URL",
   "CLOUD_TASKS_QUEUE",
   "CLOUD_TASKS_LOCATION",
+  // Grace period before source chunks are deleted, so the Ubuntu VLM pipeline
+  // can still read them. Falls back to 24h in code when unset.
+  "CHUNK_CLEANUP_DELAY_SEC",
 ];
 const buildKeys = [
   "NEXT_PUBLIC_APP_NAME",
