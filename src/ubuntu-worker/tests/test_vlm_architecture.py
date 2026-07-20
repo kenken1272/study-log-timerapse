@@ -100,7 +100,7 @@ def test_both_builders_share_the_same_instructions_and_schema():
     # Identical task text means results from the two models are comparable.
     assert bare_text == inline_text
     assert "concentration_score" in bare_text
-    assert "JSONのみ" in bare_text
+    assert "単一のJSONオブジェクトのみ" in bare_text
 
 
 def test_system_prompt_forbids_identification_for_both():
@@ -117,3 +117,31 @@ def test_frame_timestamps_appear_in_the_prompt():
     text = build_messages_with_images(["a", "b"], [1.88, 5.62], 30.0)[-1]["content"][-1]["text"]
     assert "1.88秒" in text
     assert "5.62秒" in text
+
+
+@pytest.mark.parametrize("name", ["float16", "float32"])
+def test_supported_compute_dtypes_resolve(name):
+    pytest.importorskip("torch", reason="torch not installed")
+    from app.vlm_runtime import resolve_dtype
+
+    assert resolve_dtype(name) is not None
+
+
+def test_bfloat16_is_rejected():
+    # Turing (sm_75) has no bf16 path. Accepting it here would fail later and
+    # far less clearly than refusing it up front.
+    pytest.importorskip("torch", reason="torch not installed")
+    from app.vlm_runtime import resolve_dtype
+
+    with pytest.raises(SchemaViolation, match="float16 or float32"):
+        resolve_dtype("bfloat16")
+
+
+def test_default_compute_dtype_is_float32():
+    # Gemma 3 produces NaN logits under fp16 on this hardware. If someone
+    # "restores" fp16 as the default, this test is the tripwire.
+    from app.llm_runtime import DEFAULT_COMPUTE_DTYPE as LLM_DEFAULT
+    from app.vlm_runtime import DEFAULT_COMPUTE_DTYPE as VLM_DEFAULT
+
+    assert VLM_DEFAULT == "float32"
+    assert LLM_DEFAULT == "float32"

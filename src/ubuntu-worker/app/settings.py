@@ -62,18 +62,19 @@ class Settings:
     # --- VLM ---
     vlm_model_id: str
     vlm_architecture: str
+    vlm_compute_dtype: str
     vlm_revision: str | None
     vlm_profile: str
     vlm_slo_ms: int
     vlm_max_new_tokens: int
 
     # --- LLM ---
-    llm_model_path: str
-    llm_requested_model: str
+    llm_model_id: str
+    llm_revision: str | None
+    llm_compute_dtype: str
     llm_context_size: int
     llm_max_output_tokens: int
-    llm_gpu_layers: int
-    llm_binary: str
+    llm_fallback_model_id: str
 
     # --- Pipeline behaviour ---
     window_minutes: int
@@ -114,18 +115,24 @@ def load_settings() -> Settings:
         ),
         # auto | gemma3 | mllama. "auto" infers from the model id.
         vlm_architecture=os.environ.get("VLM_ARCHITECTURE", "auto"),
+        # float16 | float32. Turing has no bf16, so those are the only options.
+        # Gemma 3 is bf16-native and its activations can overflow fp16, so this
+        # is set from measurement rather than assumed — see the benchmark doc.
+        vlm_compute_dtype=os.environ.get("VLM_COMPUTE_DTYPE", "float32"),
         vlm_revision=os.environ.get("VLM_REVISION") or None,
         vlm_profile=os.environ.get("VLM_PROFILE", "original_8"),
         vlm_slo_ms=_env_int("VLM_SLO_MS", 25_000),
         vlm_max_new_tokens=_env_int("VLM_MAX_NEW_TOKENS", 512),
-        llm_model_path=os.environ.get("LLM_MODEL_PATH", ""),
-        llm_requested_model=os.environ.get(
-            "LLM_REQUESTED_MODEL", "Meta-Llama-3-70B-Instruct-Q2_K"
-        ),
+        llm_model_id=os.environ.get("LLM_MODEL_ID", "google/gemma-3-27b-it"),
+        llm_revision=os.environ.get("LLM_REVISION") or None,
+        llm_compute_dtype=os.environ.get("LLM_COMPUTE_DTYPE", "float32"),
+        # Start at 8192 and only widen if a real window does not fit. Gemma 3
+        # supports 128K, but the KV cache cost of that is not free.
         llm_context_size=_env_int("LLM_CONTEXT_SIZE", 8192),
         llm_max_output_tokens=_env_int("LLM_MAX_OUTPUT_TOKENS", 1200),
-        llm_gpu_layers=_env_int("LLM_GPU_LAYERS", 20),
-        llm_binary=os.environ.get("LLM_BINARY", "llama-cli"),
+        llm_fallback_model_id=os.environ.get(
+            "LLM_FALLBACK_MODEL_ID", "google/gemma-3-12b-it"
+        ),
         window_minutes=_env_int("WINDOW_MINUTES", 30),
         max_attempts=_env_int("MAX_ATTEMPTS", 5),
         session_end_grace_sec=_env_int("SESSION_END_GRACE_SEC", 120),

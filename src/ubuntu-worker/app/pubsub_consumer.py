@@ -14,6 +14,7 @@ import logging
 import threading
 from typing import Callable
 
+from app import auth
 from app.queue_db import QueueDB
 from app.schemas import ChunkRef, parse_chunk_object
 
@@ -65,7 +66,9 @@ class PubSubConsumer:
         from google.cloud import pubsub_v1
 
         self._pubsub = pubsub_v1
-        self._client = pubsub_v1.SubscriberClient()
+        self._client = pubsub_v1.SubscriberClient(
+            credentials=auth.build_credentials()
+        )
         self._path = self._client.subscription_path(project_id, subscription_id)
         self._db = db
         self._on_enqueue = on_enqueue

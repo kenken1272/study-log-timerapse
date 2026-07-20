@@ -3,10 +3,11 @@
 The model is loaded once at service start and never unloaded during normal
 operation — a per-chunk load would blow the 25s SLO on its own.
 
-Compute dtype is float16, not bfloat16: the TITAN RTX is Turing (sm_75), which
-has no native bf16 path. This matters more for Gemma 3 than for Llama, because
-Gemma 3 is natively a bf16 model and much published guidance assumes bf16 is
-available.
+Compute dtype is float32 over 4-bit weights. The TITAN RTX is Turing (sm_75)
+and has no bf16 path, and fp16 is not a usable substitute for Gemma 3: measured
+here, fp16 gives NaN logits (absmax=nan) and the model emits only special
+tokens, which decode to an empty string. fp32 keeps logits finite (absmax~66)
+and produces valid JSON. Overridable with VLM_COMPUTE_DTYPE.
 
 Two architectures are supported behind one interface so the same 30s chunk can
 be scored by either and the results compared directly:
@@ -35,7 +36,26 @@ from app.video_frames import ExtractedFrames
 
 log = logging.getLogger(__name__)
 
-QUANTIZATION = "4bit-nf4"
+QUANTIZATION = "nf4-4bit"
+# Measured on this host: Gemma 3 under fp16 yields NaN logits and empty output.
+# fp32 compute over 4-bit weights is the working configuration.
+DEFAULT_COMPUTE_DTYPE = "float32"
+
+
+def resolve_dtype(name: str):
+    """Map a dtype name to a torch dtype.
+
+    bfloat16 is deliberately absent: this host is Turing (sm_75) and has no
+    bf16 path, so accepting it would only fail later and less clearly.
+    """
+    import torch
+
+    mapping = {"float16": torch.float16, "float32": torch.float32}
+    if name not in mapping:
+        raise SchemaViolation(
+            f"unsupported compute dtype {name!r}; use float16 or float32"
+        )
+    return mapping[name]
 
 ARCH_MLLAMA = "mllama"
 ARCH_GEMMA3 = "gemma3"
@@ -79,6 +99,7 @@ class VlmResult:
 class VlmRuntime(Protocol):
     model_id: str
     quantization: str
+    compute_dtype: str
 
     def warmup(self) -> None: ...
     def analyze(self, frames: ExtractedFrames) -> VlmResult: ...
@@ -89,9 +110,11 @@ class TransformersVlmRuntime:
     """Real implementation. Imports torch lazily so tests stay importable."""
 
     def __init__(self, model_id: str, gpu_index: int, revision: str | None = None,
-                 max_new_tokens: int = 512, architecture: str = "auto") -> None:
+                 max_new_tokens: int = 512, architecture: str = "auto",
+                 compute_dtype: str = DEFAULT_COMPUTE_DTYPE) -> None:
         self.model_id = model_id
         self.quantization = QUANTIZATION
+        self.compute_dtype = compute_dtype
         self.architecture = (
             detect_architecture(model_id) if architecture == "auto" else architecture
         )
@@ -120,25 +143,25 @@ class TransformersVlmRuntime:
         import torch
         from transformers import AutoProcessor, BitsAndBytesConfig
 
+        torch_dtype = resolve_dtype(self.compute_dtype)
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            # Turing has no bf16; fp16 is the correct compute dtype here.
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=torch_dtype,
         )
         kwargs = {"revision": self._revision} if self._revision else {}
 
         log.info(
-            "loading %s (%s) onto cuda:%d (4bit nf4, fp16 compute)",
-            self.model_id, self.architecture, self._gpu_index,
+            "loading %s (%s) onto cuda:%d (4bit nf4, %s compute)",
+            self.model_id, self.architecture, self._gpu_index, self.compute_dtype,
         )
         started = time.perf_counter()
         self._model = self._model_class().from_pretrained(
             self.model_id,
             quantization_config=quant_config,
             device_map={"": self._gpu_index},
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             **kwargs,
         )
         self._processor = AutoProcessor.from_pretrained(self.model_id, **kwargs)
@@ -268,6 +291,7 @@ class MockVlmRuntime:
     def __init__(self, model_id: str = "mock-vlm", latency_ms: int = 0) -> None:
         self.model_id = model_id
         self.quantization = "none"
+        self.compute_dtype = "none"
         self._latency_ms = latency_ms
 
     def warmup(self) -> None:
@@ -308,4 +332,5 @@ def build_runtime(settings) -> VlmRuntime:
         revision=settings.vlm_revision,
         max_new_tokens=settings.vlm_max_new_tokens,
         architecture=settings.vlm_architecture,
+        compute_dtype=settings.vlm_compute_dtype,
     )

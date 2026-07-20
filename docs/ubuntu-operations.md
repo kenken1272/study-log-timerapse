@@ -8,7 +8,9 @@ Root: `/home/suzukilab/study-timelapse-worker`
 ```
 current/            deployed source (rsync target — never edit here)
 venv/               virtualenv
-models/             GGUF / HF weights (never in git)
+models/             local model artefacts (never in git)
+                    HF weights live in ~/.cache/huggingface/hub, shared with
+                    the lab's other work — do not duplicate them here
 state/pipeline.db   SQLite queue
 state/*.lock        GPU exclusion locks
 state/gpu-restore-* restart info for services stopped for this pipeline
@@ -103,10 +105,12 @@ sqlite3 "$DB" "DELETE FROM meta WHERE key IN ('vlm_profile','vlm_demoted');"
 systemctl --user restart study-timelapse-worker
 ```
 
-**LLM OOM.** The ladder handles it automatically and records `fallback_used` and
-`fallback_reason` in the report. Persistent fallback means the primary model
-does not fit this configuration — lower `LLM_GPU_LAYERS` (more layers into the
-125GiB of host RAM) or accept the alternate model.
+**LLM OOM.** The ladder handles it automatically and records `fallback_used`
+and `fallback_reason` in the report. It degrades context 8192 -> 4096, then
+enables CPU offload, then drops to `gemma-3-12b-it`. Persistent fallback means
+the 27B does not fit this configuration; either accept the 12B by setting
+`LLM_MODEL_ID=google/gemma-3-12b-it`, or investigate what else is holding VRAM
+on GPU1.
 
 **GPU renumbered after a reboot.** The worker records GPU UUIDs and logs a
 warning when the topology changes. Verify with `nvidia-smi -L` and correct
@@ -171,7 +175,7 @@ These cannot be done non-interactively and are deliberately not automated:
 - `sudo systemctl stop ollama` — sudo password
 - `sudo loginctl enable-linger suzukilab` — needed for the worker to survive
   logout
-- Meta model licence acceptance on Hugging Face, and `huggingface-cli login`
+- Re-running `hf auth login` if the Hugging Face token is revoked
 - Re-running `gcloud auth application-default login` when ADC expires
 
 Never paste a token or password into a command that gets logged, into source, or

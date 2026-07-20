@@ -19,7 +19,12 @@ from pathlib import Path
 from app import aggregator, gpu_manager, result_store, video_frames
 from app.gcs_client import ChunkGone, GcsClient, is_transient
 from app.health import HealthServer
-from app.llm_runtime import LlamaCppRuntime, LlmConfig, MockLlmRuntime, build_fallback_ladder
+from app.llm_runtime import (
+    LlmConfig,
+    MockLlmRuntime,
+    TransformersLlmRuntime,
+    build_fallback_ladder,
+)
 from app.logging_config import configure as configure_logging
 from app.pubsub_consumer import PubSubConsumer
 from app.queue_db import (
@@ -55,8 +60,10 @@ class Worker:
         self.db = QueueDB(settings.db_path)
         self.gcs = GcsClient(settings.project_id, settings.bucket_name)
         self.vlm = build_runtime(settings)
-        self.llm = MockLlmRuntime() if settings.dry_run else LlamaCppRuntime(
-            binary=settings.llm_binary, gpu_index=settings.llm_gpu
+        self.llm = MockLlmRuntime() if settings.dry_run else TransformersLlmRuntime(
+            gpu_index=settings.llm_gpu,
+            revision=settings.llm_revision,
+            compute_dtype=settings.llm_compute_dtype,
         )
         self.gpu_lock = gpu_manager.GpuLock(settings.root / "state")
         self.profile = settings.vlm_profile
@@ -222,6 +229,8 @@ class Worker:
             runtime=ChunkRuntime(
                 model=self.vlm.model_id,
                 quantization=self.vlm.quantization,
+                compute_dtype=getattr(self.vlm, "compute_dtype", "unknown"),
+                dry_run=self.settings.dry_run,
                 download_ms=download_ms,
                 frame_extract_ms=frame_extract_ms,
                 vlm_preprocess_ms=result.preprocess_ms,
@@ -419,27 +428,23 @@ class Worker:
         return payloads
 
     def _build_ladder(self) -> list[LlmConfig]:
+        """Primary 27B, its degradations, then the smaller 12B as a last resort."""
         primary = LlmConfig(
-            model_path=self.settings.llm_model_path,
-            display_name=self.settings.llm_requested_model,
-            quantization="Q2_K",
+            model_id=self.settings.llm_model_id,
+            display_name=self.settings.llm_model_id,
             context_size=self.settings.llm_context_size,
-            gpu_layers=self.settings.llm_gpu_layers,
             max_output_tokens=self.settings.llm_max_output_tokens,
         )
         alternates = []
-        models = self.settings.models_dir
-        qwen = models / "Qwen2.5-32B-Instruct-Q4_K_M.gguf"
-        small = models / "Meta-Llama-3.1-8B-Instruct-Q6_K.gguf"
-        if qwen.exists():
+        fallback = self.settings.llm_fallback_model_id
+        if fallback and fallback != self.settings.llm_model_id:
             alternates.append(
-                LlmConfig(str(qwen), "Qwen2.5-32B-Instruct-Q4_K_M", "Q4_K_M", 8192, 40,
-                          self.settings.llm_max_output_tokens)
-            )
-        if small.exists():
-            alternates.append(
-                LlmConfig(str(small), "Meta-Llama-3.1-8B-Instruct-Q6_K", "Q6_K", 8192, 99,
-                          self.settings.llm_max_output_tokens)
+                LlmConfig(
+                    model_id=fallback,
+                    display_name=fallback,
+                    context_size=min(self.settings.llm_context_size, 8192),
+                    max_output_tokens=self.settings.llm_max_output_tokens,
+                )
             )
         return build_fallback_ladder(primary, alternates)
 

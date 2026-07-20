@@ -12,8 +12,8 @@ URLs, timelapse generation, Firebase auth, or the Gemini path changes behaviour.
 | SQLite queue between Pub/Sub and inference | Acking after a durable commit means a crash mid-inference costs a redelivery, not a chunk. |
 | Idempotency key includes GCS `generation` | The same object path can legitimately be re-uploaded. Path alone cannot tell a re-upload from a redelivery. |
 | Deferred chunk deletion | Previously chunks were deleted inline the moment the timelapse was built, so any Ubuntu downtime meant permanent data loss for analysis. |
-| Frames, not video, to the VLM | Llama-3.2-Vision is an image+text model. Handing it a WebM is not a supported input. |
-| Aggregation model as a subprocess | Guarantees VRAM returns to the OS when the burst ends, so the VLM gets its card back. |
+| Frames, not video, to the VLM | Gemma 3 is an image+text model. Handing it a WebM is not a supported input. |
+| Aggregation model unloaded after each burst | Returns VRAM to the OS immediately, so the VLM gets its card back within seconds. |
 
 ## Data flow
 
@@ -99,48 +99,65 @@ span, never taken from the model's own claim about its input.
 
 | | Default | Notes |
 |---|---|---|
-| VLM | `VLM_GPU` | Resident. Loading per chunk would blow the SLO alone. |
-| LLM | `LLM_GPU` | Bursty. Layers beyond `LLM_GPU_LAYERS` stay in the host's ~125GiB RAM. |
+| VLM | `VLM_GPU=0` | Resident. Loading per chunk would blow the SLO alone. |
+| LLM | `LLM_GPU=1` | Loaded per burst, unloaded straight after. CPU offload only if it will not otherwise fit. |
 
-Two modes were designed for; pick from measurement:
-
-- **Mode A (default)** — LLM on its own card with CPU offload. The VLM keeps
-  running throughout, so no chunk backlog builds up.
-- **Mode B** — split the LLM across both cards. Requires unloading the VLM,
-  taking the exclusive file lock, then reloading and re-warming it afterwards.
-  Chunks arriving meanwhile wait in SQLite.
+The two models live on separate cards, so the aggregation burst never stalls
+chunk processing and no backlog builds up. Chunks that arrive during a burst
+simply wait in SQLite.
 
 Exclusion is a `filelock` on disk, not an in-process boolean, so a second worker
-instance cannot double-load a card. Model subprocesses start in their own
-process group and are terminated as a group, so a worker crash cannot orphan a
-process holding 20GB of VRAM.
+instance cannot double-load a card.
 
 ## Model policy
 
-Requested models are fixed; whether they fit is decided by measurement.
+Both models are Google Gemma 3, run through Transformers with identical
+quantization and dtype. One dependency stack, one quantization path, one dtype
+policy — nothing in this pipeline uses llama.cpp, GGUF, or any Meta model.
 
-- **Per chunk:** `meta-llama/Llama-3.2-11B-Vision-Instruct`, bitsandbytes 4-bit
-  NF4, **fp16** compute — the TITAN RTX is Turing (sm_75) and has no bf16 path.
-- **Per window:** `Meta-Llama-3-70B-Instruct` Q2_K via llama.cpp. File size is
-  verified before download rather than assumed; 70B Q2_K is commonly ~26GB, not
-  22GB.
+| Role | Model | Device | Residency |
+|---|---|---|---|
+| Per 30s chunk | `google/gemma-3-12b-it` | GPU0 (`VLM_GPU`) | resident |
+| Per 30 min / final | `google/gemma-3-27b-it` | GPU1 (`LLM_GPU`) | on demand |
 
-Fallback ladder, bounded and recorded in the output:
+Both: `Gemma3ForConditionalGeneration`, bitsandbytes NF4 4-bit, **float16**
+compute. Gemma 3 is natively bf16 and most published guidance assumes it, but
+the TITAN RTX is Turing (sm_75) and has no bf16 path — so fp16 is not a
+preference here, it is the only option.
 
-1. primary
-2. primary at context 4096
-3. primary at reduced GPU layers and batch size
-4. `Qwen2.5-32B-Instruct` Q4_K_M
-5. `Llama-3.1-8B-Instruct` Q6_K
+Model ids are environment variables (`VLM_MODEL_ID`, `LLM_MODEL_ID`), so
+swapping either is config, not code.
 
+The VLM stays loaded because a per-chunk load would blow the 25s SLO by itself.
+The aggregation model is the opposite: loaded for a burst and unloaded
+immediately after — in a `finally`, so it releases on success, OOM and crash
+alike — because holding ~18GB idle on GPU1 buys nothing and the VLM needs its
+own card back within seconds.
+
+`VLM_ARCHITECTURE` (`auto|gemma3|mllama`) still exists and the Mllama path is
+still implemented. That is deliberate: it costs almost nothing, and it means a
+Llama vision model could be scored on the same chunk with the same prompt and
+schema for comparison. `auto` refuses to guess. Note that `paligemma-3b`
+contains the substring `gemma-3`; PaliGemma is a different architecture, is out
+of scope, and is rejected by name. It is present in the HF cache on this host
+from other lab work, so that check is load-bearing rather than theoretical.
+
+### OOM ladder
+
+Bounded, each rung attempted at most once, and always recorded:
+
+1. `gemma-3-27b-it`, context 8192, GPU only
+2. same, context 4096
+3. same, context 4096, CPU offload into the host's ~125GiB of RAM
+4. `gemma-3-12b-it`
+
+OOM is classified from the exception type, not by matching strings in stderr —
+misclassifying a config error as OOM would silently downgrade the model.
 `requested_model` always names what was asked for and `used_model` what actually
-ran, so a quietly degraded report is visible rather than invisible. OOM is
-classified from actual stderr and exit codes, never guessed — misclassifying a
-config error as OOM would silently downgrade the model.
+ran, so a quietly degraded report is visible rather than invisible.
 
-Q2_K is aggressive quantization. Model size is not evidence of output quality:
-schema conformance, agreement with the input log, and repetition are all
-checked.
+Context starts at 8192 rather than Gemma 3's full 128K. A 60-chunk window is
+nowhere near that, and the KV cache cost of a wide context is real.
 
 ## Privacy and safety
 

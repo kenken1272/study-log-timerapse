@@ -128,6 +128,9 @@ def main() -> int:
             all_results.extend(runs)
 
             if failed:
+                # An error is not an SLO miss. Trying a lighter profile will not
+                # fix a model that returns unusable output, but the distinction
+                # has to survive into the report.
                 continue
 
             worst = max(run["total_ms"] for run in runs)
@@ -144,7 +147,21 @@ def main() -> int:
 
         if chosen_profile is not None:
             break
-        print(f"--- {model_id} met no profile within the SLO")
+
+        errored = [
+            run for run in all_results
+            if run.get("model") == model_id and run.get("error")
+        ]
+        if errored and not any(
+            run.get("model") == model_id and "total_ms" in run for run in all_results
+        ):
+            # Every attempt raised: this is a correctness problem, not a speed
+            # one, and reporting it as "too slow" would send the next person
+            # chasing the wrong thing.
+            print(f"--- {model_id} produced no usable output at any profile "
+                  f"({errored[0]['error'][:100]})")
+        else:
+            print(f"--- {model_id} met no profile within the SLO")
 
     payload = {
         "candidates": candidates,
@@ -161,7 +178,12 @@ def main() -> int:
     print(f"\nwrote {args.out}")
 
     if chosen_profile is None:
-        print("WARNING: no model/profile combination met the SLO.")
+        timed = [run for run in all_results if "total_ms" in run]
+        if timed:
+            print("WARNING: no model/profile combination met the SLO.")
+        else:
+            print("WARNING: no attempt produced usable output — every run errored.")
+            print("         This is a correctness bug, not a performance result.")
         print("         Do not enable the service on these numbers.")
         return 1
 

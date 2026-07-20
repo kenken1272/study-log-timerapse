@@ -95,7 +95,12 @@ class ChunkMetrics(BaseModel):
 class ChunkRuntime(BaseModel):
     model: str
     quantization: str
+    compute_dtype: str = "float32"
+    # True when a mock model produced this record. Makes a dry-run artefact
+    # sitting in GCS impossible to mistake for a real analysis.
+    dry_run: bool = False
     download_ms: int = 0
+    model_load_ms: int = 0
     decode_ms: int = 0
     frame_extract_ms: int = 0
     vlm_preprocess_ms: int = 0
@@ -161,9 +166,13 @@ class LlmRuntime(BaseModel):
     requested_model: str
     used_model: str
     quantization: str
+    compute_dtype: str = "float32"
     fallback_used: bool = False
     fallback_reason: str | None = None
     context_size: int
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    model_load_ms: int = 0
     inference_ms: int = 0
     peak_vram_mib: int = 0
 
@@ -212,10 +221,20 @@ def extract_json_text(text: str) -> str:
     if fenced and fenced.group(1):
         return fenced.group(1).strip()
 
-    first = trimmed.find("{")
-    last = trimmed.rfind("}")
-    if first >= 0 and last > first:
-        return trimmed[first : last + 1]
+    # A top-level array must be extracted as an array, not by slicing between
+    # the first "{" and last "}" — that would produce "{a},{b}", which is not
+    # valid JSON and would look like a model failure rather than a shape issue.
+    first_bracket = trimmed.find("[")
+    first_brace = trimmed.find("{")
+    if first_bracket >= 0 and (first_brace < 0 or first_bracket < first_brace):
+        last_bracket = trimmed.rfind("]")
+        if last_bracket > first_bracket:
+            return trimmed[first_bracket : last_bracket + 1]
+
+    if first_brace >= 0:
+        last = trimmed.rfind("}")
+        if last > first_brace:
+            return trimmed[first_brace : last + 1]
 
     return trimmed
 
@@ -240,9 +259,26 @@ def repair_json_text(text: str) -> str:
     return candidate
 
 
+def _unwrap(value):
+    """Accept a single-object array as well as a bare object.
+
+    Gemma 3 sometimes wraps its answer in a list — one entry per input image,
+    or just a stray pair of brackets. Taking the first object is safe; a
+    multi-entry list is not, because picking one would silently discard the
+    model's other answers.
+    """
+    if isinstance(value, list):
+        if len(value) == 1 and isinstance(value[0], dict):
+            return value[0]
+        raise ValueError(
+            f"expected a single JSON object, got a list of {len(value)}"
+        )
+    return value
+
+
 def parse_model_json(text: str) -> dict:
     """Parse model output, attempting exactly one repair pass on failure."""
     try:
-        return json.loads(extract_json_text(text))
+        return _unwrap(json.loads(extract_json_text(text)))
     except json.JSONDecodeError:
-        return json.loads(repair_json_text(text))
+        return _unwrap(json.loads(repair_json_text(text)))

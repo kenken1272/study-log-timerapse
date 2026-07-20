@@ -94,3 +94,22 @@ def test_parse_model_json_closes_a_truncated_object():
 def test_chunk_metrics_rejects_negative_posture_count():
     with pytest.raises(Exception):
         ChunkMetrics.model_validate({**VALID, "posture_change_count": -1})
+
+
+def test_accepts_a_single_object_wrapped_in_an_array():
+    # Gemma 3 sometimes wraps its answer in a list, which is a shape quirk
+    # rather than a model failure.
+    metrics = coerce_metrics(json.dumps([VALID]))
+    assert metrics.concentration_score == 80
+
+
+def test_accepts_a_fenced_array():
+    metrics = coerce_metrics(f"```json\n{json.dumps([VALID])}\n```")
+    assert metrics.presence == "present"
+
+
+def test_rejects_a_multi_entry_array_rather_than_picking_one():
+    # Silently taking the first entry would discard the model's other answers
+    # and present a partial reading as if it were the whole chunk.
+    with pytest.raises(SchemaViolation):
+        coerce_metrics(json.dumps([VALID, VALID]))

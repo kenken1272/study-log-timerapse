@@ -11,7 +11,8 @@ SYSTEM_PROMPT = """あなたは学習セッションの映像から観察でき�
   スマートフォン操作、離席など観察可能な手掛かりからの推定値である。
 - 判断材料が乏しい場合は confidence を下げ、presence や primary_activity に
   unclear を使う。無理に断定しない。
-- 出力はJSONオブジェクトのみ。前置き、説明、コードフェンスを付けない。
+- 出力は単一のJSONオブジェクトのみ。配列にしない。フレームごとに分けない。
+- 前置き、説明、コードフェンスを付けない。
 """
 
 USER_TEMPLATE = """これは学習セッションの録画から抽出した連続する{frame_count}枚の静止画です。
@@ -33,7 +34,7 @@ USER_TEMPLATE = """これは学習セッションの録画から抽出した連�
   "evidence_offsets_seconds": [根拠となったフレームの経過秒数]
 }}
 
-JSONのみを出力してください。"""
+8枚全体をまとめた単一のJSONオブジェクトのみを出力してください。配列にしないでください。"""
 
 
 def build_user_prompt(offsets_seconds: list[float], duration_seconds: float) -> str:

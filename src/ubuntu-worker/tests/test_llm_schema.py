@@ -11,7 +11,13 @@ from app.llm_prompt import build_prompt, compact_chunk_rows
 from app.llm_runtime import LlmConfig, LlmFailed, MockLlmRuntime
 from app.schemas import AggregateAnalysis
 
-LADDER = [LlmConfig("/models/primary.gguf", "Meta-Llama-3-70B-Instruct-Q2_K", "Q2_K", 8192, 20)]
+LADDER = [
+    LlmConfig(
+        model_id="google/gemma-3-27b-it",
+        display_name="google/gemma-3-27b-it",
+        context_size=8192,
+    )
+]
 
 
 def make_plan(chunk_count: int = 60, minutes: int = 30) -> aggregator.WindowPlan:
@@ -52,7 +58,7 @@ def test_produces_a_valid_report():
     analysis = aggregator.build_analysis(make_plan(), make_payloads(60), MockLlmRuntime(), LADDER)
     assert isinstance(analysis, AggregateAnalysis)
     assert analysis.session_id == "sess-1"
-    assert analysis.runtime.requested_model == "Meta-Llama-3-70B-Instruct-Q2_K"
+    assert analysis.runtime.requested_model == "google/gemma-3-27b-it"
 
 
 def test_dry_run_output_never_claims_the_real_model_ran():

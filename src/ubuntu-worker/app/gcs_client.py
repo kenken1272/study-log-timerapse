@@ -21,6 +21,8 @@ from typing import Any
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import storage
 
+from app import auth
+
 log = logging.getLogger(__name__)
 
 # Errors worth retrying rather than dead-lettering.
@@ -41,7 +43,9 @@ class ChunkGone(Exception):
 
 class GcsClient:
     def __init__(self, project_id: str, bucket_name: str) -> None:
-        self._client = storage.Client(project=project_id)
+        self._client = storage.Client(
+            project=project_id, credentials=auth.build_credentials()
+        )
         self._bucket = self._client.bucket(bucket_name)
         self.bucket_name = bucket_name
 

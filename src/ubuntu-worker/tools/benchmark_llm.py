@@ -18,10 +18,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import aggregator, gpu_manager
-from app.llm_runtime import LlamaCppRuntime, LlmConfig, build_fallback_ladder
+from app.llm_runtime import LlmConfig, TransformersLlmRuntime, build_fallback_ladder
 from app.settings import load_settings
 
 BASE = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
+
+
+def _process_rss_mib() -> int:
+    """Resident host RAM, which matters once layers spill off the GPU."""
+    try:
+        with open("/proc/self/status") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
 
 
 def synthetic_payloads(count: int) -> list[dict]:
@@ -58,29 +70,30 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunks", type=int, default=60)
     parser.add_argument("--context", type=int, default=None)
-    parser.add_argument("--gpu-layers", type=int, default=None)
     parser.add_argument("--out", type=Path, default=Path("benchmark-llm.json"))
     args = parser.parse_args()
 
     settings = load_settings()
-    model_path = Path(settings.llm_model_path)
-    if not model_path.exists():
-        print(f"error: LLM_MODEL_PATH does not exist: {model_path}")
-        return 1
-
-    size_gib = model_path.stat().st_size / 1024**3
-    print(f"model file: {model_path.name} ({size_gib:.1f} GiB)")
+    print(f"model: {settings.llm_model_id}")
     print(f"GPU before: {gpu_manager.memory_used_mib()}")
 
     primary = LlmConfig(
-        model_path=str(model_path),
-        display_name=settings.llm_requested_model,
-        quantization="Q2_K",
+        model_id=settings.llm_model_id,
+        display_name=settings.llm_model_id,
         context_size=args.context or settings.llm_context_size,
-        gpu_layers=args.gpu_layers if args.gpu_layers is not None else settings.llm_gpu_layers,
         max_output_tokens=settings.llm_max_output_tokens,
     )
-    ladder = build_fallback_ladder(primary, [])
+    alternates = []
+    if settings.llm_fallback_model_id != settings.llm_model_id:
+        alternates.append(
+            LlmConfig(
+                model_id=settings.llm_fallback_model_id,
+                display_name=settings.llm_fallback_model_id,
+                context_size=min(primary.context_size, 8192),
+                max_output_tokens=settings.llm_max_output_tokens,
+            )
+        )
+    ladder = build_fallback_ladder(primary, alternates)
 
     payloads = synthetic_payloads(args.chunks)
     plan = aggregator.WindowPlan(
@@ -93,7 +106,7 @@ def main() -> int:
         aggregation_key="benchmark|window",
     )
 
-    runtime = LlamaCppRuntime(settings.llm_binary, settings.llm_gpu)
+    runtime = TransformersLlmRuntime(settings.llm_gpu, settings.llm_revision)
     started = time.perf_counter()
     schema_valid = True
     error: str | None = None
@@ -110,11 +123,11 @@ def main() -> int:
     print(f"GPU after:  {usage}")
 
     payload = {
-        "model_file": model_path.name,
-        "model_size_gib": round(size_gib, 2),
+        "model": settings.llm_model_id,
+        "fallback_model": settings.llm_fallback_model_id,
         "context_size": primary.context_size,
-        "gpu_layers": primary.gpu_layers,
         "chunk_count": args.chunks,
+        "cpu_ram_mib": _process_rss_mib(),
         "total_ms": elapsed_ms,
         "schema_valid": schema_valid,
         "error": error,
@@ -127,6 +140,10 @@ def main() -> int:
 
     if analysis:
         print(f"used model:   {analysis.runtime.used_model}")
+        print(f"load:         {analysis.runtime.model_load_ms}ms")
+        print(f"prompt tok:   {analysis.runtime.prompt_tokens}")
+        print(f"output tok:   {analysis.runtime.output_tokens}")
+        print(f"peak VRAM:    {analysis.runtime.peak_vram_mib}MiB")
         print(f"fallback:     {analysis.runtime.fallback_used}")
         print(f"inference:    {analysis.runtime.inference_ms}ms")
         print(f"summary:      {analysis.summary[:120]}")
