@@ -4,7 +4,10 @@ import { GoogleAuth } from "google-auth-library";
 
 const DEFAULT_SIGNING_SERVICE_ACCOUNT_EMAIL =
   "study-timelapse-sa@vla-test1.iam.gserviceaccount.com";
-const SIGNED_URL_TTL_SEC = 150 * 60;
+// 15 minutes. A chunk upload takes seconds to a couple of minutes, so a URL
+// that stays valid for hours only widens the window in which a leaked one is
+// usable. Retries fetch a fresh URL rather than reusing an expiring one.
+const SIGNED_URL_TTL_SEC = 15 * 60;
 
 let storage: Storage | null = null;
 let googleAuth: GoogleAuth | null = null;

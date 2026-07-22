@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
-import { enqueueTimelapseProcessingTask } from "@/lib/gcp/tasks";
+import { enqueueTimelapseProcessingTask, getTimelapseBackend } from "@/lib/gcp/tasks";
 import { writeSessionMetadata } from "@/lib/gcp/userData";
 import {
   finishSession,
@@ -45,13 +45,22 @@ export async function POST(request: Request, context: RouteContext) {
     await writeSessionMetadata(session);
     if (session.type === "recorded") {
       await updateSessionProcessing(id);
-      try {
-        await enqueueTimelapseProcessingTask(id);
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "タイムラプス生成を開始できませんでした。";
-        await updateSessionFailed(id, message);
-        throw error;
+      if (getTimelapseBackend() === "ubuntu") {
+        // No Cloud Tasks entry, so no FFmpeg on Cloud Run. The Ubuntu worker
+        // notices endedAt in the metadata.json just written above, waits for
+        // the last chunks to settle, and calls back when the render is done.
+        // The session stays `processing` until then, which is what the UI
+        // already renders as "準備中".
+        console.log(`[finish] ${id} handed to the Ubuntu timelapse worker`);
+      } else {
+        try {
+          await enqueueTimelapseProcessingTask(id);
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "タイムラプス生成を開始できませんでした。";
+          await updateSessionFailed(id, message);
+          throw error;
+        }
       }
     }
 

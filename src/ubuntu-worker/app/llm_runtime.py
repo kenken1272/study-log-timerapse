@@ -1,0 +1,444 @@
+"""The 30-minute / final aggregation model: Gemma 3 27B at 4-bit on the LLM GPU.
+
+Runs through Transformers rather than llama.cpp, matching the VLM, so both
+models share one dependency stack, one quantization path and one dtype policy.
+
+Loaded on demand and unloaded as soon as the burst finishes: the VLM needs its
+own card back within seconds, and holding 20GB idle on GPU1 buys nothing.
+
+Compute dtype is float32 over 4-bit weights. Gemma 3 is natively bf16, and this
+host is Turing (sm_75) with no bf16 path — but fp16 is not a usable substitute:
+measured on this machine, Gemma 3 under fp16 produces NaN logits and generates
+nothing but special tokens. fp32 compute is the configuration that works.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import logging
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from app import gpu_manager
+from app.cuda_health import FATAL_CUDA_EXIT_CODE
+from app.schemas import LlmRuntime as LlmRuntimeInfo
+from app.schemas import parse_model_json
+
+log = logging.getLogger(__name__)
+
+QUANTIZATION = "nf4-4bit"
+# Gemma 3 produces NaN logits under fp16 on this hardware (measured: absmax=nan,
+# empty output). fp32 compute over 4-bit weights is the working configuration.
+DEFAULT_COMPUTE_DTYPE = "float32"
+
+
+class LlmOom(Exception):
+    """Ran out of memory, as opposed to giving a bad answer."""
+
+
+class LlmFailed(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class LlmConfig:
+    """One rung of the fallback ladder."""
+
+    model_id: str
+    display_name: str
+    quantization: str = QUANTIZATION
+    context_size: int = 8192
+    max_output_tokens: int = 1200
+    # Transformers generates one sequence at a time here, so "batch size" is
+    # not a real knob. The memory it would have controlled is the KV cache,
+    # which context_size and max_output_tokens govern instead.
+    cpu_offload: bool = False
+
+
+@dataclass
+class LlmOutput:
+    payload: dict
+    runtime: LlmRuntimeInfo
+
+
+def is_oom(error: BaseException) -> bool:
+    """Classify from the exception itself rather than guessing from a string."""
+    name = type(error).__name__
+    if name in ("OutOfMemoryError", "CudaOutOfMemoryError"):
+        return True
+    text = str(error).lower()
+    return "out of memory" in text or "cuda oom" in text
+
+
+def build_fallback_ladder(
+    primary: LlmConfig, alternates: list[LlmConfig] | None = None
+) -> list[LlmConfig]:
+    """Primary, then its documented degradations, then smaller models.
+
+    Bounded on purpose: each rung is attempted at most once, so an OOM loop
+    cannot run forever.
+    """
+    ladder = [primary]
+    if primary.context_size > 4096:
+        ladder.append(replace(primary, context_size=4096))
+    if not primary.cpu_offload:
+        ladder.append(
+            replace(
+                primary,
+                context_size=min(primary.context_size, 4096),
+                cpu_offload=True,
+            )
+        )
+    ladder.extend(alternates or [])
+    return ladder
+
+
+class TransformersLlmRuntime:
+    """Loads, generates, and unloads. Never stays resident between bursts."""
+
+    def __init__(self, gpu_index: int, revision: str | None = None,
+                 compute_dtype: str = DEFAULT_COMPUTE_DTYPE) -> None:
+        self._gpu_index = gpu_index
+        self._revision = revision
+        self.compute_dtype = compute_dtype
+        self._model = None
+        self._processor = None
+        self._loaded_config: LlmConfig | None = None
+        self.last_load_ms = 0
+        self.last_prompt_tokens = 0
+        self.last_output_tokens = 0
+
+    # ------------------------------------------------------------------
+
+    def _load(self, config: LlmConfig) -> None:
+        import torch
+        from transformers import AutoProcessor, BitsAndBytesConfig, Gemma3ForConditionalGeneration
+
+        from app.vlm_runtime import resolve_dtype
+
+        torch_dtype = resolve_dtype(self.compute_dtype)
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch_dtype,
+            # Required whenever any module lands on CPU. Without it bitsandbytes
+            # refuses the dispatch outright, which made the offload rung fail
+            # for a reason unrelated to memory and denied the larger model its
+            # one real chance of fitting.
+            llm_int8_enable_fp32_cpu_offload=config.cpu_offload,
+        )
+        kwargs = {"revision": self._revision} if self._revision else {}
+
+        if config.cpu_offload:
+            # Spill whatever will not fit into the host's ~125GiB of RAM rather
+            # than forcing the whole model onto one 24GB card.
+            free_mib = gpu_manager.memory_free_mib(self._gpu_index)
+            budget = max(4, int(free_mib / 1024) - 3)
+            device_map = "auto"
+            max_memory = {self._gpu_index: f"{budget}GiB", "cpu": "80GiB"}
+            log.info("loading %s with CPU offload (GPU budget %dGiB)",
+                     config.model_id, budget)
+        else:
+            device_map = {"": self._gpu_index}
+            max_memory = None
+            log.info("loading %s onto cuda:%d (4bit nf4, %s compute)",
+                     config.model_id, self._gpu_index, self.compute_dtype)
+
+        started = time.perf_counter()
+        self._model = Gemma3ForConditionalGeneration.from_pretrained(
+            config.model_id,
+            quantization_config=quant_config,
+            device_map=device_map,
+            max_memory=max_memory,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+        self._processor = AutoProcessor.from_pretrained(config.model_id, **kwargs)
+        self._model.eval()
+        self.last_load_ms = int((time.perf_counter() - started) * 1000)
+        self._loaded_config = config
+        log.info("aggregation model loaded in %dms", self.last_load_ms)
+
+    def unload(self) -> None:
+        """Return VRAM to the OS so the VLM can have its card back.
+
+        Runs even when the load itself raised: a failed from_pretrained can
+        leave a partially materialised model holding most of the card, and the
+        next ladder rung would then OOM for the wrong reason.
+        """
+        import sys
+
+        import torch
+
+        self._model = None
+        self._processor = None
+        self._loaded_config = None
+        # A live exception keeps its traceback, and the traceback keeps frame
+        # locals — including tensors from the failed load. Clear it explicitly.
+        if hasattr(sys, "last_traceback"):
+            sys.last_traceback = None
+        sys.exc_info()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(self._gpu_index)
+        log.info("aggregation model unloaded from cuda:%d", self._gpu_index)
+
+    # ------------------------------------------------------------------
+
+    def _generate_once(self, config: LlmConfig, prompt: str) -> tuple[str, int]:
+        import torch
+
+        self._load(config)
+
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        ]
+        inputs = self._processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            # Bound the KV cache. Gemma 3 supports 128K, but nothing here needs
+            # it and the memory cost is real.
+            truncation=True,
+            max_length=config.context_size,
+        ).to(self._model.device)
+
+        prompt_tokens = int(inputs["input_ids"].shape[-1])
+        self.last_prompt_tokens = prompt_tokens
+
+        started = time.perf_counter()
+        with torch.inference_mode():
+            output = self._model.generate(
+                **inputs,
+                max_new_tokens=config.max_output_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
+        torch.cuda.synchronize(self._gpu_index)
+        inference_ms = int((time.perf_counter() - started) * 1000)
+
+        generated = output[0][prompt_tokens:]
+        self.last_output_tokens = int(generated.shape[-1])
+        text = self._processor.decode(generated, skip_special_tokens=True)
+        return text, inference_ms
+
+    def generate(
+        self, ladder: list[LlmConfig], prompt: str, validate=None
+    ) -> LlmOutput:
+        """Walk the ladder until a rung produces *usable* JSON.
+
+        `validate` is the schema check. It runs inside the loop on purpose: a
+        rung that returns well-formed JSON with the wrong shape is just as
+        unusable as one that OOMs, and should fall through to the next rung
+        rather than failing the whole aggregation. Observed with the 27B, which
+        parsed cleanly but returned an empty concentration block.
+        """
+        last_error: Exception | None = None
+        fallback_reason: str | None = None
+
+        for index, config in enumerate(ladder):
+            is_fallback = index > 0
+            try:
+                log.info(
+                    "LLM attempt %d/%d: %s ctx=%d offload=%s",
+                    index + 1, len(ladder), config.display_name,
+                    config.context_size, config.cpu_offload,
+                )
+                peak_before = gpu_manager.peak_vram_mib(self._gpu_index)
+                text, inference_ms = self._generate_once(config, prompt)
+                peak = max(peak_before, gpu_manager.peak_vram_mib(self._gpu_index))
+                payload = parse_model_json(text)
+                if validate is not None:
+                    validate(payload)
+
+                return LlmOutput(
+                    payload=payload,
+                    runtime=LlmRuntimeInfo(
+                        requested_model=ladder[0].display_name,
+                        used_model=config.display_name,
+                        quantization=config.quantization,
+                        compute_dtype=self.compute_dtype,
+                        fallback_used=is_fallback,
+                        fallback_reason=fallback_reason if is_fallback else None,
+                        context_size=config.context_size,
+                        prompt_tokens=self.last_prompt_tokens,
+                        output_tokens=self.last_output_tokens,
+                        model_load_ms=self.last_load_ms,
+                        inference_ms=inference_ms,
+                        peak_vram_mib=peak,
+                    ),
+                )
+            except Exception as error:
+                last_error = error
+                # Drop references to the failed load before anything else.
+                self._model = None
+                self._processor = None
+                if is_oom(error):
+                    fallback_reason = (
+                        f"CUDA OOM on {config.display_name} "
+                        f"(ctx={config.context_size}, offload={config.cpu_offload})"
+                    )
+                    log.warning("LLM OOM on %s; releasing VRAM before next rung",
+                                config.display_name)
+                else:
+                    fallback_reason = f"{config.display_name} failed: {str(error)[:200]}"
+                    log.warning("LLM failure on %s: %s", config.display_name, error)
+            finally:
+                # Always release, whether the rung succeeded, OOMed or crashed.
+                self.unload()
+                _wait_for_vram_release(self._gpu_index)
+
+        raise LlmFailed(f"all {len(ladder)} LLM configurations failed: {last_error}")
+
+
+def _wait_for_vram_release(gpu_index: int, timeout: float = 60.0) -> None:
+    """Confirm the memory actually came back before trying the next rung."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        used = gpu_manager.memory_used_mib().get(gpu_index, 0)
+        if used < 1024:
+            return
+        time.sleep(2)
+    log.warning(
+        "GPU%d still reports %dMiB after %.0fs",
+        gpu_index, gpu_manager.memory_used_mib().get(gpu_index, 0), timeout,
+    )
+
+
+class MockLlmRuntime:
+    """Deterministic stand-in for tests and WORKER_DRY_RUN."""
+
+    def __init__(self, fail_times: int = 0) -> None:
+        self._fail_times = fail_times
+        self.calls = 0
+
+    def unload(self) -> None:
+        return None
+
+    def generate(self, ladder: list[LlmConfig], prompt: str, validate=None) -> LlmOutput:
+        self.calls += 1
+        index = min(self._fail_times, len(ladder) - 1)
+        config = ladder[index]
+        return LlmOutput(
+            payload={
+                "summary": "観察ログに基づく要約です。前半は着席が継続し、後半に離席が増えました。",
+                "concentration": {
+                    "average_score": 68.0,
+                    "trend": "declining",
+                    "high_periods": [],
+                    "low_periods": [],
+                },
+                "observed_patterns": ["後半にスマートフォン操作の記録が増えた"],
+                "bottlenecks": ["30分経過後の離席頻度の上昇"],
+                "recommendations": [
+                    {
+                        "priority": 1,
+                        "title": "25分ごとに区切る",
+                        "reason": "後半に離席が集中していた",
+                        "action": "次回は25分学習・5分休憩のタイマーを設定する",
+                    }
+                ],
+                "data_quality": {"coverage_ratio": 0.9, "warnings": []},
+            },
+            runtime=LlmRuntimeInfo(
+                requested_model=ladder[0].display_name,
+                # Never claim the real model ran. A dry-run report must be
+                # distinguishable from a genuine one at a glance.
+                used_model=f"mock-llm ({config.display_name})",
+                quantization="none",
+                compute_dtype="none",
+                fallback_used=index > 0,
+                fallback_reason="mock fallback" if index > 0 else None,
+                context_size=config.context_size,
+                prompt_tokens=0,
+                output_tokens=0,
+                model_load_ms=0,
+                inference_ms=1200,
+                peak_vram_mib=0,
+            ),
+        )
+
+
+class SubprocessLlmRuntime:
+    """Runs each aggregation in a short-lived child process.
+
+    Same interface as TransformersLlmRuntime, so aggregator.build_analysis does
+    not know the difference. The child does the model work and dies, which is
+    what makes the VRAM come back and what keeps a CUDA fault out of the
+    parent's context — see tools/aggregate_once.py for the measurements that
+    motivated this.
+    """
+
+    def __init__(self, gpu_index: int, revision: str | None = None,
+                 compute_dtype: str = DEFAULT_COMPUTE_DTYPE,
+                 python_executable: str | None = None,
+                 timeout_sec: float = 1800.0) -> None:
+        self._gpu_index = gpu_index
+        self._revision = revision
+        self.compute_dtype = compute_dtype
+        self._python = python_executable or sys.executable
+        self._timeout = timeout_sec
+
+    def unload(self) -> None:
+        # Nothing is resident between calls; the child already exited.
+        return None
+
+    def generate(self, ladder: list[LlmConfig], prompt: str, validate=None) -> LlmOutput:
+        from dataclasses import asdict
+
+        job = json.dumps({
+            "prompt": prompt,
+            "gpu_index": self._gpu_index,
+            "compute_dtype": self.compute_dtype,
+            "revision": self._revision,
+            "ladder": [asdict(rung) for rung in ladder],
+        })
+
+        worker_root = Path(__file__).resolve().parent.parent
+        started = time.perf_counter()
+        process = subprocess.run(
+            [self._python, "-m", "tools.aggregate_once"],
+            input=job,
+            capture_output=True,
+            text=True,
+            cwd=str(worker_root),
+            timeout=self._timeout,
+        )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        if process.returncode == FATAL_CUDA_EXIT_CODE:
+            # Contained: the child's context died, not ours. The VLM in this
+            # process is untouched and keeps serving chunks.
+            log.error(
+                "aggregation subprocess hit a fatal CUDA error (contained, "
+                "the resident VLM is unaffected): %s", process.stderr.strip()[:300]
+            )
+            raise LlmFailed(f"fatal CUDA error in aggregation subprocess: "
+                            f"{process.stderr.strip()[:300]}")
+        if process.returncode != 0:
+            raise LlmFailed(
+                f"aggregation subprocess exited {process.returncode}: "
+                f"{process.stderr.strip()[:400]}"
+            )
+
+        try:
+            result = json.loads(process.stdout)
+        except json.JSONDecodeError as error:
+            raise LlmFailed(f"aggregation subprocess returned no JSON: {error}") from error
+
+        payload = result["payload"]
+        if validate is not None:
+            validate(payload)
+
+        runtime = LlmRuntimeInfo.model_validate(result["runtime"])
+        log.info("aggregation subprocess completed in %dms (model=%s fallback=%s)",
+                 elapsed_ms, runtime.used_model, runtime.fallback_used)
+        return LlmOutput(payload=payload, runtime=runtime)

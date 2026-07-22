@@ -1,0 +1,47 @@
+[project]
+name = "study-timelapse-worker"
+version = "0.1.0"
+description = "Ubuntu-side VLM/LLM asynchronous analysis pipeline for Study Timelapse"
+requires-python = ">=3.10,<3.13"
+
+# Pinned so the Ubuntu runtime copy is reproducible. Torch/bitsandbytes are
+# installed separately in scripts/ubuntu-preflight.sh because the correct wheel
+# depends on the CUDA runtime present on the host.
+dependencies = [
+  "pydantic==2.9.2",
+  "google-cloud-pubsub==2.23.0",
+  "google-cloud-storage==2.18.2",
+  "google-auth==2.35.0",
+  "filelock==3.16.1",
+  "python-dotenv==1.0.1",
+  "nvidia-ml-py==12.560.30",
+]
+
+[project.optional-dependencies]
+# Heavyweight inference stack. Not needed for the mock test suite.
+vlm = [
+  # >=4.50 is required for Gemma3ForConditionalGeneration; 4.45 does not have it.
+  "transformers==4.51.3",
+  "accelerate==1.6.0",
+  "bitsandbytes==0.45.3",
+  "pillow==10.4.0",
+]
+dev = [
+  "pytest==8.3.3",
+  "pytest-asyncio==0.24.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Only the application ships. An installed `tests` package shadows the source
+# tree on the deploy host and breaks collection.
+include = ["app*"]
+exclude = ["tests*", "tools*", "migrations*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["ignore::DeprecationWarning"]

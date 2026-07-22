@@ -1,0 +1,363 @@
+# Ubuntu worker — operations
+
+Host: `suzukilab@100.74.222.81` (slabPCX, Ubuntu 24.04, 2× TITAN RTX 24GB)
+Root: `/home/suzukilab/study-timelapse-worker`
+
+## Layout
+
+```
+current/            deployed source (rsync target — never edit here)
+venv/               virtualenv
+models/             local model artefacts (never in git)
+                    HF weights live in ~/.cache/huggingface/hub, shared with
+                    the lab's other work — do not duplicate them here
+state/pipeline.db   SQLite queue
+state/*.lock        GPU exclusion locks
+state/gpu-restore-* restart info for services stopped for this pipeline
+spool/              transient video, umask 077, deleted after upload
+logs/worker.log     rotating, 20MB × 5
+config/worker.env   credentials, chmod 600, never committed
+```
+
+## Everyday commands
+
+```bash
+# status
+systemctl --user status study-timelapse-worker
+
+# logs
+journalctl --user -u study-timelapse-worker -f
+tail -f ~/study-timelapse-worker/logs/worker.log
+
+# health (loopback only)
+curl -s http://127.0.0.1:8799/health | python3 -m json.tool
+
+# start / stop / restart
+systemctl --user start   study-timelapse-worker
+systemctl --user stop    study-timelapse-worker
+systemctl --user restart study-timelapse-worker
+```
+
+## Deploy and rollback
+
+```bash
+# deploy (from the Mac)
+./scripts/deploy-ubuntu-worker.sh
+ssh <host> 'systemctl --user restart study-timelapse-worker'
+
+# what is deployed
+ssh <host> 'cat ~/study-timelapse-worker/current/REVISION'
+
+# rollback: check out the previous commit locally and redeploy
+git checkout <previous-sha> -- src/ubuntu-worker
+./scripts/deploy-ubuntu-worker.sh
+```
+
+The queue database, models, spool and config are excluded from rsync, so a
+deploy never destroys in-flight work.
+
+## Queue inspection
+
+```bash
+DB=~/study-timelapse-worker/state/pipeline.db
+
+# state breakdown
+sqlite3 "$DB" 'SELECT state, COUNT(*) FROM chunks GROUP BY state;'
+
+# stuck / failed work
+sqlite3 "$DB" "SELECT session_id, segment_index, chunk_index, attempts, error_class,
+               substr(error_message,1,80) FROM chunks WHERE state='DEAD_LETTER';"
+
+# per-session progress
+sqlite3 "$DB" "SELECT state, COUNT(*) FROM chunks WHERE session_id='<sid>' GROUP BY state;"
+
+# aggregation units
+sqlite3 "$DB" 'SELECT aggregation_key, state, attempts FROM aggregations;'
+```
+
+Requeue dead-lettered chunks after fixing the underlying cause (the source
+chunks must still exist — check the cleanup delay has not elapsed):
+
+```bash
+sqlite3 "$DB" "UPDATE chunks SET state='RECEIVED', attempts=0, next_attempt_at=0
+               WHERE state='DEAD_LETTER' AND error_class!='chunk_gone';"
+systemctl --user restart study-timelapse-worker
+```
+
+## Recovery scenarios
+
+**Worker was offline for a while.** Pub/Sub retains messages for 7 days. On
+start, the subscriber drains the backlog into SQLite and the chunk loop works
+through it. Source chunks survive for `CHUNK_CLEANUP_DELAY_SEC` (default 24h)
+after a session finishes, so anything inside that window is still recoverable.
+Beyond it, chunks are gone and those entries dead-letter as `chunk_gone` — this
+is recorded, never silently ignored.
+
+**Chunks are being dead-lettered as `chunk_gone`.** Cleanup won the race.
+Increase `CHUNK_CLEANUP_DELAY_SEC` on the Cloud Run service and redeploy.
+
+**SLO demotion.** Check `demoted` and `current_profile` in the health endpoint.
+Demotion is one-way by design. To restore quality, fix the cause, re-run
+`./scripts/ubuntu-benchmark-vlm.sh`, set `VLM_PROFILE` accordingly, then:
+
+```bash
+sqlite3 "$DB" "DELETE FROM meta WHERE key IN ('vlm_profile','vlm_demoted');"
+systemctl --user restart study-timelapse-worker
+```
+
+**LLM OOM.** The ladder handles it automatically and records `fallback_used`
+and `fallback_reason` in the report. It degrades context 8192 -> 4096, then
+enables CPU offload, then drops to `gemma-3-12b-it`. Persistent fallback means
+the 27B does not fit this configuration; either accept the 12B by setting
+`LLM_MODEL_ID=google/gemma-3-12b-it`, or investigate what else is holding VRAM
+on GPU1.
+
+**GPU renumbered after a reboot.** The worker records GPU UUIDs and logs a
+warning when the topology changes. Verify with `nvidia-smi -L` and correct
+`VLM_GPU` / `LLM_GPU`.
+
+**Orphaned model process holding VRAM.** Should not happen — subprocesses run in
+their own process group and are terminated as a group. If one does appear,
+identify it before acting:
+
+```bash
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+readlink -f /proc/<PID>/exe   # confirm it is ours before signalling
+kill -TERM <PID>
+```
+
+Never use `killall python` or a broad `pkill -f python` on this host — it runs
+other people's research jobs.
+
+## Timelapse rendering
+
+Rendering moved off Cloud Run onto this host. Cloud Run keeps the web app,
+Firestore, auth and cleanup scheduling; it no longer runs FFmpeg.
+
+```
+finish API -> metadata.json (endedAt)
+                    |
+        worker sees it, waits >= 60s, checks the sources are complete
+                    |
+        download -> ffmpeg -> ffprobe validate -> upload to GCS
+                    |
+        POST /api/internal/sessions/{id}/timelapse-complete  (OIDC)
+                    |
+        Cloud Run: Firestore ready + metadata.json + schedule 24h cleanup
+```
+
+### Encoder choice
+
+`libx264`, not NVENC — measured on this host with real chunks:
+
+| 360 chunks (~3h) | wall | encode portion | output |
+|---|---|---|---|
+| libx264 veryfast crf28 | 62.0s | 7.7s | **19.2 MB** |
+| h264_nvenc p4 cq28 | 54.8s | 0.5s | 30.4 MB |
+| decode only | 54.3s | — | — |
+
+Decode is 88% of the work: `setpts` makes ffmpeg decode every input frame and
+drop most of them, so a three-hour session decodes ~324k frames to emit ~2.7k.
+NVENC accelerates the part that was never the bottleneck and produces a file
+58% larger at matched quality. Since the point of the move is cost, the smaller
+file wins and GPU0's encoder stays free for the VLM.
+
+`TIMELAPSE_ENCODER=h264_nvenc` switches it back; NVENC failures fall back to
+libx264 automatically and record `fallback_used`.
+
+The exact command:
+
+```
+ffmpeg -y -hide_banner -loglevel error \
+  -f concat -safe 0 -i files.txt \
+  -filter:v setpts=PTS/<speed>,fps=30,scale=1280:-2 -an \
+  -c:v libx264 -preset veryfast -crf 28 \
+  -pix_fmt yuv420p -movflags +faststart timelapse.mp4
+```
+
+### When a render starts
+
+Never on a timer alone. All of these must hold:
+
+- `metadata.json` has `endedAt`, and >= 60s have passed since it was noticed
+- no chunk is still in a non-terminal state (RECEIVED/EXTRACTING/VLM_RUNNING/...)
+- `COMPLETED + DEAD_LETTER >= chunkCount` from metadata
+- the GCS chunk listing holds at least `chunkCount` distinct slots
+- without `chunkCount`, the listing must be unchanged for >= 60s (logged as a
+  weaker signal)
+- no other render is running
+
+Chunks that failed analysis do **not** block rendering — the source video is
+still there — but they are always logged.
+
+### Inspecting jobs
+
+```bash
+DB=~/study-timelapse-worker/state/pipeline.db
+sqlite3 "$DB" 'SELECT session_id,state,attempts,encoder,chunks_used,chunks_skipped
+               FROM timelapse_jobs ORDER BY updated_at DESC LIMIT 10;'
+```
+
+`CALLBACK_PENDING` means the video is rendered, validated and uploaded but
+Cloud Run has not confirmed. The worker retries only the callback — it does not
+re-encode.
+
+### Rollback
+
+Two independent switches; either alone stops new Ubuntu renders.
+
+**Cloud Run** — restores the original Cloud Tasks -> do-process -> FFmpeg path:
+
+```bash
+gcloud run services update study-timelapse --region asia-northeast1 \
+  --update-env-vars TIMELAPSE_BACKEND=cloudrun
+```
+
+**Ubuntu** — stops the worker rendering at all:
+
+```bash
+sed -i 's/^TIMELAPSE_ENABLED=.*/TIMELAPSE_ENABLED=0/' \
+  ~/study-timelapse-worker/config/worker.env
+systemctl --user restart study-timelapse-worker
+```
+
+Set both when rolling back deliberately: Cloud Run first, so nothing is
+rendering while the flag flips.
+
+Rolling back destroys nothing. GCS chunks, analysis JSON, existing
+timelapse.mp4 and thumbnail.jpg, Firestore sessions and the SQLite job rows
+(including attempt counts) all survive — the Ubuntu path simply stops being
+used, and sessions finished afterwards go through Cloud Run again.
+
+Videos already rendered on Ubuntu keep playing: the output paths, codec and
+Firestore fields are identical to what Cloud Run produced.
+
+## Fatal CUDA errors
+
+Some CUDA errors are sticky: once raised, every subsequent CUDA call in that
+process fails identically, **on every device**. On 2026-07-20 a single Xid 13
+(misaligned address) on GPU1 during aggregation was followed two seconds later
+by the VLM failing on GPU0 with valid input. The worker retried in the same
+process, so four healthy chunks burned all five attempts against a dead context
+and were dead-lettered, and three aggregations failed 822 times over two hours.
+Re-run in a fresh process, those chunks succeeded on the first attempt.
+
+The worker now exits with code 70 on such an error and systemd restarts it with
+a fresh context. Expected and healthy behaviour:
+
+```bash
+journalctl --user -u study-timelapse-worker | grep -i "fatal CUDA"
+systemctl --user show study-timelapse-worker -p NRestarts
+```
+
+Chunks interrupted this way are requeued **without** consuming an attempt —
+a poisoned context says nothing about the chunk it happened to interrupt.
+
+If restarts are frequent (more than a few per day), that is a real signal:
+check `journalctl -k | grep Xid` and treat repeated Xid 13 as a hardware or
+driver issue rather than something the retry logic should absorb.
+
+### Recovering chunks dead-lettered by a context failure
+
+They are identifiable and safe to requeue, but do it per session, never in
+bulk, and archive the history first:
+
+```sql
+-- inspect
+SELECT session_id, COUNT(*) FROM chunks
+ WHERE state='DEAD_LETTER' AND error_message LIKE '%misaligned address%'
+ GROUP BY session_id;
+```
+
+The source WebM must still exist in GCS — beyond `CHUNK_CLEANUP_DELAY_SEC`
+(24h) it will not, and those chunks are unrecoverable.
+
+## Services stopped for this pipeline
+
+The GPUs were freed on 2026-07-20. Nothing was uninstalled or deleted; the
+processes were stopped with SIGTERM and exited cleanly in 3 seconds.
+
+| What | Restart |
+|---|---|
+| SO-101/Pi0.5 policy server (was :50051, 16.7GB) | `python /home/suzukilab/so101-pi05-infer/scripts/policy_server_pi05_fp32.py --host 100.74.222.81 --port 50051` |
+| voice_memory worker (2.3GB) | `cd ~/voice-memory/backend && ~/miniforge3/envs/voice_memory/bin/python -m app.workers.worker` |
+| voice_memory API (was :8787) | `cd ~/voice-memory/backend && ~/miniforge3/envs/voice_memory/bin/uvicorn app.main:app --host 127.0.0.1 --port 8787 --workers 1` |
+| ollama.service (:11434) | `sudo systemctl start ollama` — left running; holds no VRAM with no model loaded |
+
+Exact recorded state, including full argv:
+`~/study-timelapse-worker/state/gpu-restore-20260720-121211.txt`
+
+Neither the conda environments nor any model weights for these projects were
+touched.
+
+## Authentication
+
+The worker uses **ADC** at `~/.config/gcloud/application_default_credentials.json`
+(mode 600, owned by `suzukilab`, quota project `vla-test1`). `worker.env`
+deliberately does not set `GOOGLE_APPLICATION_CREDENTIALS`.
+
+Verify:
+
+```bash
+gcloud auth application-default print-access-token >/dev/null && echo ok
+```
+
+If the worker starts logging 401/403 from GCS or Pub/Sub, ADC has expired or
+been revoked — re-run `gcloud auth application-default login` on the host.
+
+The worker impersonates `study-timelapse-worker@vla-test1` via
+`IMPERSONATE_SERVICE_ACCOUNT`. ADC mints a short-lived token for it on demand,
+so **no service account key file exists anywhere**.
+
+Its permissions:
+
+| Role | Scope |
+|---|---|
+| `roles/pubsub.subscriber` | the chunk subscription |
+| `roles/storage.objectViewer` | the bucket |
+| `roles/storage.objectCreator` | the bucket |
+| `roles/storage.objectAdmin` | **conditional**: `resource.name.endsWith('.json')` |
+
+The conditional binding is not optional and the reason is not obvious: **GCS
+requires `storage.objects.delete` to overwrite an existing object.** With
+create-only permission the first `status.json` write succeeds and every
+subsequent one returns 403, silently freezing the UI's progress display. This
+was only caught because a re-run happened to overwrite rather than create.
+
+The condition restricts overwrite/delete to `.json`, so source chunks
+(`.webm`), timelapses (`.mp4`) and thumbnails (`.jpg`) can never be destroyed —
+which is the property that actually matters.
+
+Known limitation: `metadata.json` and `profile.json` also end in `.json`, so
+they fall inside the condition. The worker has no code path that writes or
+deletes them, and `tests/test_no_delete_capability.py` enforces that there is
+no delete call at all — but at the IAM layer this is wider than intended. IAM
+conditions cannot express the needed pattern (`resource.name.contains()` is
+rejected, and the variable uid sits mid-path so `startsWith` cannot reach the
+`analysis/` segment). Tightening further would require a separate bucket for
+analysis output.
+
+Verify the boundary holds:
+
+```bash
+SA=study-timelapse-worker@vla-test1.iam.gserviceaccount.com
+# expected: succeeds
+echo '{}' | gcloud storage cp - gs://BUCKET/users/UID/sessions/SID/analysis/status.json \
+  --impersonate-service-account=$SA
+# expected: denied, object still present
+gcloud storage rm gs://BUCKET/users/UID/sessions/SID/segments/0/chunks/0.webm \
+  --impersonate-service-account=$SA
+```
+
+## Things that need a human
+
+These cannot be done non-interactively and are deliberately not automated:
+
+- `sudo systemctl stop ollama` — sudo password
+- `sudo loginctl enable-linger suzukilab` — needed for the worker to survive
+  logout
+- Re-running `hf auth login` if the Hugging Face token is revoked
+- Re-running `gcloud auth application-default login` when ADC expires
+
+Never paste a token or password into a command that gets logged, into source, or
+into a chat transcript.

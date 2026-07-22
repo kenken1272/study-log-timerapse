@@ -161,6 +161,11 @@ function snapshotToSession(
     reflectionNote: data.reflectionNote ?? null,
     timelapsePath: data.timelapsePath ?? null,
     timelapseSizeBytes: data.timelapseSizeBytes ?? null,
+    // Mapped explicitly: this object is built field by field, so a stored
+    // value that is not listed here is silently dropped on read. Leaving it
+    // out made the completion callback's duplicate check compare against
+    // undefined and re-schedule cleanup on every retry.
+    timelapseFingerprint: data.timelapseFingerprint ?? null,
     thumbnailPath: data.thumbnailPath ?? null,
     errorMessage: data.errorMessage ?? null,
     analysisStatus: data.analysisStatus ?? "none",
@@ -559,12 +564,20 @@ export async function updateSessionReady(
   timelapsePath: string,
   timelapseSizeBytes: number,
   thumbnailPath: string | null,
+  /**
+   * Identifies the exact set of source chunks this render consumed. Only the
+   * Ubuntu renderer supplies it; it is what lets a repeated completion
+   * callback be recognised as a repeat rather than a new result, so cleanup is
+   * scheduled once. The Cloud Run path has no equivalent and omits it.
+   */
+  timelapseFingerprint?: string,
 ): Promise<void> {
   await sessionCollection().doc(sessionId).update({
     status: "ready",
     timelapsePath,
     timelapseSizeBytes,
     thumbnailPath,
+    ...(timelapseFingerprint ? { timelapseFingerprint } : {}),
     analysisStatus: "none" satisfies AnalysisStatus,
     updatedAt: Timestamp.now(),
   });

@@ -92,6 +92,49 @@ export async function deleteStoredChunk(id: string): Promise<void> {
   await withStore("readwrite", (store) => store.delete(id));
 }
 
+/**
+ * Reset chunks left mid-flight by a previous page load.
+ *
+ * `uploading` is set before the PUT starts. If the tab is closed, reloaded, or
+ * the request hangs and the page goes away, the chunk keeps that status with
+ * `objectPath: null` and nothing ever retries it — the exact state seen on the
+ * affected devices. Anything still `uploading` at startup had no process
+ * behind it, so it is safe to reclaim to `pending`.
+ *
+ * Blobs are never deleted here; only the status changes.
+ */
+export async function reclaimStaleUploads(sessionId?: string): Promise<number> {
+  const db = await openDb();
+  const all = await new Promise<StoredChunk[]>((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, "readonly");
+    const request = transaction.objectStore(STORE_NAME).getAll();
+    request.onsuccess = () => resolve(request.result as StoredChunk[]);
+    request.onerror = () => reject(request.error);
+    transaction.oncomplete = () => db.close();
+  });
+
+  const stale = all.filter(
+    (chunk) =>
+      chunk.uploadStatus === "uploading" &&
+      (sessionId ? chunk.sessionId === sessionId : true),
+  );
+
+  for (const chunk of stale) {
+    await updateStoredChunk(chunk.id, {
+      uploadStatus: "pending",
+      errorMessage: "前回のアップロードが完了しませんでした。再試行します。",
+    });
+  }
+
+  return stale.length;
+}
+
+/** Chunks the user may want to retry, with their per-chunk error text. */
+export async function listFailedChunks(sessionId?: string): Promise<StoredChunk[]> {
+  const chunks = await listPendingChunks(sessionId);
+  return chunks.filter((chunk) => chunk.uploadStatus === "failed");
+}
+
 export async function listPendingChunks(sessionId?: string): Promise<StoredChunk[]> {
   const db = await openDb();
   return new Promise((resolve, reject) => {

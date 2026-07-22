@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { jsonError, requireAuthenticatedUser } from "@/lib/api/auth";
 import { getSession, getSessionForUser, toJsonSession } from "@/lib/sessions/firestore";
+import { getTimelapseBackend } from "@/lib/gcp/tasks";
 import { processTimelapse } from "@/lib/video/processTimelapse";
 
 export const runtime = "nodejs";
@@ -44,6 +45,17 @@ export async function POST(request: Request, context: RouteContext) {
       return NextResponse.json(
         { error: "Only recorded sessions can be processed." },
         { status: 400 },
+      );
+    }
+
+    if (getTimelapseBackend() === "ubuntu") {
+      // A task enqueued before the switch can still arrive. Running FFmpeg now
+      // would both defeat the point of the migration and race the Ubuntu
+      // worker for the same output object.
+      console.log(`[do-process] ${id} ignored: timelapse backend is ubuntu`);
+      return NextResponse.json(
+        { ok: true, skipped: "timelapse backend is ubuntu" },
+        { status: 200 },
       );
     }
 

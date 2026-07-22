@@ -7,7 +7,9 @@ import { Play, Save, X } from "lucide-react";
 import type { JsonRecordingSegment, JsonStudySession, StudyQuality } from "@/lib/sessions/types";
 import {
   deleteStoredChunk,
+  listFailedChunks,
   listPendingChunks,
+  reclaimStaleUploads,
   saveChunk,
   updateStoredChunk,
   type StoredChunk,
@@ -22,17 +24,39 @@ import {
   updateChunkIndex,
   type ActiveSessionState,
 } from "@/lib/client/sessionResume";
-import { fetchWithRetry, friendlyFetchError } from "@/lib/client/fetchWithRetry";
+import {
+  fetchWithRetry,
+  friendlyFetchError,
+  putWithTimeout,
+} from "@/lib/client/fetchWithRetry";
+import { drainQueue, enqueueUpload } from "@/lib/client/uploadQueue";
 import { formatDuration, formatShortDate } from "@/lib/time/format";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { QualitySelector } from "@/components/QualitySelector";
 import { RecordingStatusPanel } from "@/components/RecordingStatusPanel";
 import { SmallCameraPreview } from "@/components/SmallCameraPreview";
 import { StudyMinutesControl } from "@/components/StudyMinutesControl";
+import { UploadRetryPanel } from "@/components/UploadRetryPanel";
 import { useAuth } from "@/hooks/use-auth";
 
 const CHUNK_TIMESLICE_MS = 30_000;
+// A 9.3MB chunk on a slow uplink can legitimately take over a minute, so the
+// timeout is generous — its job is to catch hangs, not to police slowness.
+const UPLOAD_TIMEOUT_MS = 120_000;
+const UPLOAD_RETRIES = 2;
+const UPLOAD_RETRY_DELAY_MS = 1_500;
+// Stopping must not block forever on a wedged upload.
+const UPLOAD_DRAIN_TIMEOUT_MS = 15_000;
+// Give up a backlog sweep after this many transient failures in a row.
+const MAX_CONSECUTIVE_UPLOAD_FAILURES = 3;
 const MIN_CHUNK_DURATION_MS = 1_000;
+// Cap the capture bitrate. Left unset, browsers default to roughly 2.5Mbit/s at
+// 1280x720, producing ~9.3MB per 30s chunk — measured at ~109s to upload on a
+// ~85KB/s link, so uploads could never keep pace with recording and the backlog
+// grew without bound. 600kbit/s gives ~2.2MB per chunk (~26s on the same link).
+// The timelapse is downscaled to 1280 wide and sped up 30-120x, so the loss of
+// detail is not visible in the finished artefact.
+const VIDEO_BITS_PER_SECOND = 600_000;
 
 type SessionResponse = {
   session: JsonStudySession;
@@ -64,6 +88,25 @@ function preferredMimeType(): string {
   return "";
 }
 
+class HttpStatusError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "HttpStatusError";
+    this.status = status;
+  }
+}
+
+/**
+ * A chunk that can never be uploaded, however many times it is retried —
+ * its session was deleted, or belongs to someone else. Retrying these forever
+ * would block every other chunk behind them in the queue.
+ */
+function isUnrecoverable(error: unknown): boolean {
+  return error instanceof HttpStatusError && (error.status === 404 || error.status === 403);
+}
+
 async function postJson<T>(
   authenticatedFetch: AuthenticatedFetch,
   url: string,
@@ -77,7 +120,7 @@ async function postJson<T>(
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(errorBody.error ?? "Request failed.");
+    throw new HttpStatusError(response.status, errorBody.error ?? "Request failed.");
   }
 
   return (await response.json()) as T;
@@ -123,7 +166,6 @@ function CameraRecorderInner() {
   const streamRef = useRef<MediaStream | null>(null);
   const authTokenRef = useRef<string | null>(null);
   const sessionRef = useRef<JsonStudySession | null>(null);
-  const uploadPromisesRef = useRef<Promise<void>[]>([]);
   const successfulChunkCountRef = useRef(0);
   const chunkIndexRef = useRef(0);
   const segmentIndexRef = useRef(0);
@@ -149,6 +191,8 @@ function CameraRecorderInner() {
     typeof navigator === "undefined" ? true : navigator.onLine,
   );
   const [pendingUploadCount, setPendingUploadCount] = useState(0);
+  const [failedChunks, setFailedChunks] = useState<StoredChunk[]>([]);
+  const [isRetryingUploads, setIsRetryingUploads] = useState(false);
   const [resumableSession, setResumableSession] = useState<JsonStudySession | null>(null);
   const [activeSessionState, setActiveSessionState] = useState<ActiveSessionState | null>(() =>
     typeof window === "undefined" ? null : loadActiveSession(),
@@ -197,52 +241,125 @@ function CameraRecorderInner() {
     setPendingUploadCount(pending.length);
   }, []);
 
-  const uploadStoredChunk = useCallback(async (chunk: StoredChunk): Promise<void> => {
-    await updateStoredChunk(chunk.id, {
-      uploadStatus: "uploading",
-      errorMessage: null,
-    });
-
-    const uploadData = await postJson<UploadUrlResponse>(
-      authFetchWithRetry,
-      `/api/sessions/${chunk.sessionId}/upload-url`,
-      {
-        segmentIndex: chunk.segmentIndex,
-        chunkIndex: chunk.chunkIndex,
-        contentType: chunk.contentType,
-      },
-    );
-    const uploadResponse = await fetchWithRetry(
-      uploadData.uploadUrl,
-      {
-        method: "PUT",
-        headers: { "Content-Type": chunk.contentType },
-        body: chunk.blob,
-      },
-      { retries: 3, delayMs: 1200 },
-    );
-    if (!uploadResponse.ok) {
-      throw new Error("GCS chunk upload failed.");
+  const refreshFailedChunks = useCallback(async (sessionId?: string) => {
+    if (typeof indexedDB === "undefined") {
+      return;
     }
+    setFailedChunks(await listFailedChunks(sessionId));
+  }, []);
 
-    await postJson<{ ok: true }>(
-      authFetchWithRetry,
-      `/api/sessions/${chunk.sessionId}/chunk-complete`,
-      {
-        segmentIndex: chunk.segmentIndex,
-        chunkIndex: chunk.chunkIndex,
-        objectPath: uploadData.objectPath,
-        sizeBytes: chunk.sizeBytes,
-      },
-    );
-    successfulChunkCountRef.current += 1;
-    await updateStoredChunk(chunk.id, {
-      uploadStatus: "uploaded",
-      objectPath: uploadData.objectPath,
-      errorMessage: null,
-    });
-    await deleteStoredChunk(chunk.id);
-  }, [authFetchWithRetry]);
+  // Reclaim chunks left as `uploading` by a previous page load. Without this
+  // they sit with objectPath: null forever and nothing ever retries them.
+  useEffect(() => {
+    if (typeof indexedDB === "undefined") {
+      return;
+    }
+    let cancelled = false;
+
+    void (async () => {
+      const reclaimed = await reclaimStaleUploads().catch(() => 0);
+      if (cancelled) {
+        return;
+      }
+      if (reclaimed > 0) {
+        setMessage(
+          `前回未完了だったchunkが${reclaimed}件あります。「アップロードを再試行」で再開できます。`,
+        );
+      }
+      await refreshPendingCount();
+      await refreshFailedChunks();
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshFailedChunks, refreshPendingCount]);
+
+
+  const uploadStoredChunk = useCallback(
+    async (chunk: StoredChunk): Promise<void> => {
+      // One upload at a time per session. Concurrent multi-MB PUTs saturate the
+      // uplink and stall behind the browser's per-host connection limit.
+      await enqueueUpload(chunk.sessionId, async () => {
+        let lastError: unknown = null;
+
+        for (let attempt = 0; attempt <= UPLOAD_RETRIES; attempt += 1) {
+          try {
+            await updateStoredChunk(chunk.id, {
+              uploadStatus: "uploading",
+              errorMessage: null,
+            });
+
+            // A fresh signed URL per attempt. Reusing one across retries means
+            // that once it expires every remaining attempt fails identically.
+            const uploadData = await postJson<UploadUrlResponse>(
+              authFetchWithRetry,
+              `/api/sessions/${chunk.sessionId}/upload-url`,
+              {
+                segmentIndex: chunk.segmentIndex,
+                chunkIndex: chunk.chunkIndex,
+                contentType: chunk.contentType,
+              },
+            );
+
+            const uploadResponse = await putWithTimeout(
+              uploadData.uploadUrl,
+              chunk.blob,
+              chunk.contentType,
+              UPLOAD_TIMEOUT_MS,
+            );
+            if (!uploadResponse.ok) {
+              throw new Error(
+                `GCS chunk upload failed (HTTP ${uploadResponse.status}).`,
+              );
+            }
+
+            await postJson<{ ok: true }>(
+              authFetchWithRetry,
+              `/api/sessions/${chunk.sessionId}/chunk-complete`,
+              {
+                segmentIndex: chunk.segmentIndex,
+                chunkIndex: chunk.chunkIndex,
+                objectPath: uploadData.objectPath,
+                sizeBytes: chunk.sizeBytes,
+              },
+            );
+            successfulChunkCountRef.current += 1;
+            await updateStoredChunk(chunk.id, {
+              uploadStatus: "uploaded",
+              objectPath: uploadData.objectPath,
+              errorMessage: null,
+            });
+            await deleteStoredChunk(chunk.id);
+            return;
+          } catch (error) {
+            lastError = error;
+            if (isUnrecoverable(error)) {
+              // The session is gone. More attempts cannot change that.
+              break;
+            }
+            if (attempt < UPLOAD_RETRIES) {
+              await new Promise((resolve) =>
+                window.setTimeout(resolve, UPLOAD_RETRY_DELAY_MS * (attempt + 1)),
+              );
+            }
+          }
+        }
+
+        // Never leave the chunk stuck on `uploading`: that is invisible to the
+        // user and nothing retries it. The blob itself is kept for retry.
+        const message = isUnrecoverable(lastError)
+          ? "このchunkの録画セッションが見つかりません。すでに削除された可能性があります。"
+          : friendlyFetchError(lastError, "chunk upload failed.");
+        await updateStoredChunk(chunk.id, {
+          uploadStatus: "failed",
+          errorMessage: message,
+        });
+        throw lastError instanceof Error ? lastError : new Error(message);
+      });
+    },
+    [authFetchWithRetry],
+  );
 
   const uploadPendingChunks = useCallback(
     async (sessionId?: string) => {
@@ -253,24 +370,70 @@ function CameraRecorderInner() {
 
       const pending = await listPendingChunks(sessionId);
       setPendingUploadCount(pending.length);
+
+      let consecutiveTransientFailures = 0;
+      let skipped = 0;
+
       for (const chunk of pending) {
         try {
           await uploadStoredChunk(chunk);
+          consecutiveTransientFailures = 0;
         } catch (error) {
-          const errorMessage = friendlyFetchError(error, "chunk upload failed.");
-          await updateStoredChunk(chunk.id, {
-            uploadStatus: "failed",
-            errorMessage,
-          });
-          setMessage(errorMessage);
-          break;
+          if (isUnrecoverable(error)) {
+            // Skip and keep going. With a large backlog, stopping at the first
+            // dead session would strand every healthy chunk behind it.
+            skipped += 1;
+            continue;
+          }
+
+          consecutiveTransientFailures += 1;
+          setMessage(friendlyFetchError(error, "chunk upload failed."));
+          // Repeated transient failures mean the network or server is down;
+          // stop rather than spending the whole backlog's retries against it.
+          if (consecutiveTransientFailures >= MAX_CONSECUTIVE_UPLOAD_FAILURES) {
+            break;
+          }
         } finally {
           await refreshPendingCount(sessionId);
+          await refreshFailedChunks(sessionId);
         }
       }
+
+      if (skipped > 0) {
+        setMessage(
+          `${skipped}件のchunkは録画セッションが見つからないためアップロードできません。`
+          + "他のchunkは処理を続けています。",
+        );
+      }
     },
-    [refreshPendingCount, uploadStoredChunk],
+    [refreshFailedChunks, refreshPendingCount, uploadStoredChunk],
   );
+
+  /** Manual retry: reset failed chunks to pending and sweep again. */
+  const retryFailedUploads = useCallback(async () => {
+    const sessionId = sessionRef.current?.id ?? activeSessionState?.sessionId;
+    setIsRetryingUploads(true);
+    setMessage(null);
+    try {
+      for (const chunk of await listFailedChunks(sessionId)) {
+        await updateStoredChunk(chunk.id, {
+          uploadStatus: "pending",
+          errorMessage: null,
+        });
+      }
+      await refreshFailedChunks(sessionId);
+      await uploadPendingChunks(sessionId);
+    } finally {
+      setIsRetryingUploads(false);
+      await refreshPendingCount(sessionId);
+      await refreshFailedChunks(sessionId);
+    }
+  }, [
+    activeSessionState?.sessionId,
+    refreshFailedChunks,
+    refreshPendingCount,
+    uploadPendingChunks,
+  ]);
 
   useEffect(() => {
     const active = loadActiveSession();
@@ -513,7 +676,6 @@ function CameraRecorderInner() {
       const errorMessage = friendlyFetchError(error, "chunk upload failed.");
       setMessage(errorMessage);
     });
-    uploadPromisesRef.current.push(promise);
     return promise;
   }
 
@@ -533,7 +695,10 @@ function CameraRecorderInner() {
   function startStandaloneChunkRecorder(stream: MediaStream, mimeType: string) {
     const chunks: Blob[] = [];
     const startedAtMs = Date.now();
-    const recorder = new MediaRecorder(stream, { mimeType });
+    const recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: VIDEO_BITS_PER_SECOND,
+    });
     recorderRef.current = recorder;
 
     recorder.ondataavailable = (event) => {
@@ -550,8 +715,9 @@ function CameraRecorderInner() {
       if (chunks.length > 0) {
         const contentType = chunks[0]?.type || mimeType;
         const rawBlob = new Blob(chunks, { type: contentType });
-        const promise = fixAndEnqueueRecordedBlob(rawBlob, contentType, durationMs);
-        uploadPromisesRef.current.push(promise);
+        // Not awaited: uploads are serialised inside the upload queue, and the
+        // recorder must start the next 30s segment immediately.
+        void fixAndEnqueueRecordedBlob(rawBlob, contentType, durationMs);
       }
 
       const hasLiveTrack = stream.getTracks().some((track) => track.readyState === "live");
@@ -603,7 +769,6 @@ function CameraRecorderInner() {
     segmentIndexRef.current = input.segmentIndex;
     chunkIndexRef.current = input.chunkIndex;
     successfulChunkCountRef.current = input.session.chunkCount;
-    uploadPromisesRef.current = [];
     currentSegmentStartedAtRef.current = Date.now();
     baseStudySecRef.current = input.baseStudySec;
     accumulatedBreakSecRef.current = 0;
@@ -774,11 +939,25 @@ function CameraRecorderInner() {
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
-      await Promise.all(uploadPromisesRef.current);
       const session = sessionRef.current;
+      // Bounded wait. Promise.all here used to block forever on a single
+      // wedged PUT, leaving the user stuck on the stop spinner with no way
+      // out. Anything still queued stays in IndexedDB and is retried later.
+      const drained = session
+        ? await drainQueue(session.id, UPLOAD_DRAIN_TIMEOUT_MS)
+        : true;
       if (session) {
-        await uploadPendingChunks(session.id);
+        if (drained) {
+          await uploadPendingChunks(session.id);
+        }
         await refreshPendingCount(session.id);
+        await refreshFailedChunks(session.id);
+      }
+      if (!drained) {
+        setMessage(
+          "一部のchunkがアップロード中です。この画面を離れても保存されており、"
+          + "「アップロードを再試行」で再開できます。",
+        );
       }
       if (successfulChunkCountRef.current === 0) {
         throw new Error(
@@ -852,6 +1031,12 @@ function CameraRecorderInner() {
           onStop={handleStop}
         />
         {message ? <p className="mt-4 text-sm text-red-700">{message}</p> : null}
+        <UploadRetryPanel
+          failedChunks={failedChunks}
+          pendingUploadCount={pendingUploadCount}
+          isRetrying={isRetryingUploads}
+          onRetry={() => void retryFailedUploads()}
+        />
         <SmallCameraPreview videoRef={previewRef} />
       </>
     );
@@ -866,7 +1051,15 @@ function CameraRecorderInner() {
           <p className="text-sm text-zinc-500">実勉強時間</p>
           <p className="mt-1 text-3xl font-semibold">{formatDuration(actualStudySec)}</p>
         </div>
-        <div className="space-y-5">
+        {/* Saving is blocked while uploads are outstanding, so the retry
+            control has to be reachable from this screen too. */}
+        <UploadRetryPanel
+          failedChunks={failedChunks}
+          pendingUploadCount={pendingUploadCount}
+          isRetrying={isRetryingUploads}
+          onRetry={() => void retryFailedUploads()}
+        />
+        <div className="mt-6 space-y-5">
           <label className="block">
             <span className="text-sm font-medium text-zinc-700">勉強内容</span>
             <input

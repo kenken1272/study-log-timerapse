@@ -7,9 +7,15 @@ import { ArrowLeft, Pencil, RotateCw, Save, Trash2, X } from "lucide-react";
 import { AnalysisResultCard } from "@/components/AnalysisResultCard";
 import { AnalyzeButton } from "@/components/AnalyzeButton";
 import { AuthGate } from "@/components/auth/AuthGate";
+import { LocalAnalysisCard } from "@/components/LocalAnalysisCard";
 import { QualitySelector } from "@/components/QualitySelector";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { useAuth } from "@/hooks/use-auth";
+import type {
+  LocalAnalysisReport,
+  LocalAnalysisState,
+  LocalAnalysisStatus,
+} from "@/lib/analysis/localAnalysis";
 import type { JsonStudySession, StudyQuality } from "@/lib/sessions/types";
 import { formatDuration, formatShortDate } from "@/lib/time/format";
 
@@ -26,6 +32,11 @@ export default function SessionDetailPage() {
   const [editStudyContent, setEditStudyContent] = useState("");
   const [editQuality, setEditQuality] = useState<StudyQuality>(3);
   const [editReflectionNote, setEditReflectionNote] = useState("");
+  const [localAnalysis, setLocalAnalysis] = useState<{
+    state: LocalAnalysisState;
+    status: LocalAnalysisStatus | null;
+    report: LocalAnalysisReport | null;
+  }>({ state: "queued", status: null, report: null });
 
   const loadSession = useCallback(async () => {
     const response = await authFetch(`/api/sessions/${params.id}`, { cache: "no-store" });
@@ -72,6 +83,58 @@ export default function SessionDetailPage() {
       cancelled = true;
     };
   }, [authFetch, isAuthLoading, params.id, user]);
+
+  const loadLocalAnalysis = useCallback(async () => {
+    const response = await authFetch(`/api/sessions/${params.id}/local-analysis`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      return;
+    }
+    const body = (await response.json()) as {
+      state: LocalAnalysisState;
+      status: LocalAnalysisStatus | null;
+      report: LocalAnalysisReport | null;
+    };
+    setLocalAnalysis(body);
+  }, [authFetch, params.id]);
+
+  useEffect(() => {
+    if (isAuthLoading || !user || !session?.timelapsePath) {
+      return;
+    }
+    // The final report is terminal; stop polling once it has arrived.
+    if (localAnalysis.state === "ready") {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = () => {
+      void loadLocalAnalysis().catch(() => {
+        // The Ubuntu worker is best-effort: a fetch failure leaves the panel in
+        // its previous state rather than breaking the page.
+      });
+    };
+    poll();
+
+    // Analysis lands well after the timelapse, so keep checking until it does.
+    const intervalId = window.setInterval(() => {
+      if (!cancelled) {
+        poll();
+      }
+    }, 15000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    isAuthLoading,
+    loadLocalAnalysis,
+    localAnalysis.state,
+    session?.timelapsePath,
+    user,
+  ]);
 
   useEffect(() => {
     if (!session) {
@@ -360,6 +423,15 @@ export default function SessionDetailPage() {
                 status={session.analysisStatus}
                 result={session.analysisResult}
                 errorMessage={session.analysisErrorMessage}
+              />
+            </div>
+            {/* Runs on the lab GPU from the 30s chunks, independently of the
+                Gemini analysis above. Both results are shown side by side. */}
+            <div className="mt-4 rounded-lg border border-zinc-100 bg-zinc-50 p-4">
+              <LocalAnalysisCard
+                state={localAnalysis.state}
+                status={localAnalysis.status}
+                report={localAnalysis.report}
               />
             </div>
           </section>

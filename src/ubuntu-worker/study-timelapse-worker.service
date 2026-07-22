@@ -1,0 +1,47 @@
+# systemd *user* unit — no root required.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/study-timelapse-worker/current/study-timelapse-worker.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now study-timelapse-worker
+#
+# To survive logout, linger must be enabled. That needs root, so ask before running:
+#   sudo loginctl enable-linger suzukilab
+
+[Unit]
+Description=Study Timelapse VLM/LLM analysis worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/suzukilab/study-timelapse-worker/current
+EnvironmentFile=/home/suzukilab/study-timelapse-worker/config/worker.env
+ExecStart=/home/suzukilab/study-timelapse-worker/venv/bin/python -m app.main
+
+# Model loading takes a while; do not let systemd think startup hung.
+TimeoutStartSec=600
+# Give the subscriber, SQLite and any model subprocess time to close cleanly.
+TimeoutStopSec=120
+KillMode=mixed
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=15
+# Back off instead of hammering a broken GPU: at most 5 restarts per 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=study-timelapse-worker
+
+# The worker only ever needs its own tree.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=read-only
+ReadWritePaths=/home/suzukilab/study-timelapse-worker
+
+[Install]
+WantedBy=default.target
