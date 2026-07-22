@@ -449,7 +449,18 @@ class QueueDB:
         return counts
 
     def active_sessions(self) -> list[sqlite3.Row]:
+        """Sessions whose final analysis has not been produced yet."""
         return self._query("SELECT * FROM sessions WHERE finalized=0")
+
+    def ended_sessions(self) -> list[sqlite3.Row]:
+        """Every session that has ended, regardless of analysis state.
+
+        Deliberately not active_sessions(): `finalized` tracks the LLM report,
+        and analysis finishing must not stop a timelapse from being registered.
+        Driving timelapse registration off active_sessions() meant any session
+        whose analysis completed first never got a render at all.
+        """
+        return self._query("SELECT * FROM sessions WHERE ended_at IS NOT NULL")
 
     def mark_session_ended(self, session_id: str, ended_at: float) -> None:
         with self._tx() as conn:

@@ -477,11 +477,15 @@ class Worker:
         # Register a job for every ended session that does not have one. Cheap,
         # idempotent, and means a session that ended while the worker was down
         # still gets picked up.
-        for session in self.db.active_sessions():
-            if session["ended_at"]:
-                self.db.upsert_timelapse_job(
-                    session["session_id"], session["uid"], TL_WAITING_FOR_CHUNKS
-                )
+        #
+        # ended_sessions(), not active_sessions(): the latter filters on
+        # `finalized`, which tracks the LLM report. Rendering and analysis are
+        # independent, and using the analysis filter here meant a session whose
+        # analysis finished first was silently never rendered.
+        for session in self.db.ended_sessions():
+            self.db.upsert_timelapse_job(
+                session["session_id"], session["uid"], TL_WAITING_FOR_CHUNKS
+            )
 
         if self.db.timelapse_job_in_progress():
             return

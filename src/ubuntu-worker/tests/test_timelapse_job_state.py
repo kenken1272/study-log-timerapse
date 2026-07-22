@@ -207,3 +207,45 @@ def test_callback_pending_jobs_are_picked_up_again(db):
     db.set_timelapse_state("s1", TL_CALLBACK_PENDING)
     awaiting = {row["session_id"] for row in db.timelapse_jobs_awaiting()}
     assert "s1" in awaiting
+
+
+# --- registration must not depend on the analysis lifecycle ---
+
+def test_an_analysed_session_is_still_offered_for_rendering(db):
+    """Reproduces a session stuck in "準備中" indefinitely.
+
+    `finalized` marks the LLM report as written. Registration was driven off
+    active_sessions(), which filters finalized=0, so any session whose analysis
+    completed before the render was registered never got a job at all — no
+    error, no retry, just silence. Rendering and analysis are independent.
+    """
+    from helpers import make_ref
+
+    ref = make_ref()
+    db.enqueue(ref, "bucket")
+    db.mark_session_ended("sess-1", time.time())
+    db.mark_session_finalized("sess-1")          # analysis finished first
+
+    assert [r["session_id"] for r in db.active_sessions()] == []
+    assert [r["session_id"] for r in db.ended_sessions()] == ["sess-1"]
+
+
+def test_ended_sessions_excludes_sessions_still_recording(db):
+    from helpers import make_ref
+
+    db.enqueue(make_ref(session="running"), "bucket")
+    db.enqueue(make_ref(session="done"), "bucket")
+    db.mark_session_ended("done", time.time())
+
+    assert [r["session_id"] for r in db.ended_sessions()] == ["done"]
+
+
+def test_ended_sessions_covers_both_analysis_states(db):
+    from helpers import make_ref
+
+    for name in ("analysed", "unanalysed"):
+        db.enqueue(make_ref(session=name), "bucket")
+        db.mark_session_ended(name, time.time())
+    db.mark_session_finalized("analysed")
+
+    assert {r["session_id"] for r in db.ended_sessions()} == {"analysed", "unanalysed"}
