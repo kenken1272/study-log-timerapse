@@ -36,3 +36,12 @@ def window_analysis_path(uid: str, session_id: str, window_start_iso: str) -> st
 
 def final_analysis_path(uid: str, session_id: str) -> str:
     return f"{session_prefix(uid, session_id)}analysis.json"
+
+
+def timelapse_path(uid: str, session_id: str) -> str:
+    """Unchanged from the Cloud Run implementation — the UI reads this path."""
+    return f"{session_prefix(uid, session_id)}timelapse.mp4"
+
+
+def thumbnail_path(uid: str, session_id: str) -> str:
+    return f"{session_prefix(uid, session_id)}thumbnail.jpg"

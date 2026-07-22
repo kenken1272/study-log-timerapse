@@ -80,6 +80,75 @@ class GcsClient:
         except gcp_exceptions.NotFound:
             return None
 
+    def upload_media(
+        self, object_name: str, source: Path, content_type: str
+    ) -> dict:
+        """Upload a rendered artefact and read back what GCS actually stored.
+
+        Only ever called for timelapse.mp4 and thumbnail.jpg. Deliberately not
+        generic: this class has no delete surface and no way to write an
+        arbitrary path, which is what keeps a bug here from touching a user's
+        source recordings.
+        """
+        blob = self._bucket.blob(object_name)
+        # Long-lived and immutable per generation; the UI fetches via signed
+        # URLs that already carry their own expiry.
+        blob.cache_control = "private, max-age=3600"
+        blob.upload_from_filename(str(source), content_type=content_type)
+
+        # Trust the server's view, not ours: a truncated upload would otherwise
+        # be reported as a success.
+        blob.reload()
+        stored = int(blob.size or 0)
+        local = source.stat().st_size
+        if stored != local:
+            raise ValueError(
+                f"upload size mismatch for {object_name}: "
+                f"local {local} bytes, GCS {stored} bytes"
+            )
+        if blob.content_type != content_type:
+            raise ValueError(
+                f"content-type mismatch for {object_name}: "
+                f"expected {content_type}, GCS reports {blob.content_type}"
+            )
+        return {
+            "generation": str(blob.generation),
+            "size_bytes": stored,
+            "content_type": blob.content_type,
+        }
+
+    def stat(self, object_name: str) -> dict | None:
+        """Size, generation and content type, or None when absent."""
+        blob = self._bucket.blob(object_name)
+        try:
+            blob.reload()
+        except gcp_exceptions.NotFound:
+            return None
+        return {
+            "generation": str(blob.generation),
+            "size_bytes": int(blob.size or 0),
+            "content_type": blob.content_type,
+        }
+
+    def download_to(self, object_name: str, generation: str | None, destination: Path) -> int:
+        """Stream one object to disk. Alias of download_chunk for readability."""
+        return self.download_chunk(object_name, generation, destination)
+
+    def list_chunk_objects(self, uid: str, session_id: str) -> list[dict]:
+        """List a session's source chunks with their generations."""
+        prefix = f"users/{uid}/sessions/{session_id}/segments/"
+        found = []
+        for blob in self._client.list_blobs(self._bucket, prefix=prefix):
+            if not blob.name.endswith(".webm"):
+                continue
+            found.append({
+                "object_name": blob.name,
+                "generation": str(blob.generation),
+                "size_bytes": int(blob.size or 0),
+                "time_created": blob.time_created.isoformat() if blob.time_created else None,
+            })
+        return found
+
     def list_names(self, prefix: str) -> list[str]:
         return [blob.name for blob in self._client.list_blobs(self._bucket, prefix=prefix)]
 

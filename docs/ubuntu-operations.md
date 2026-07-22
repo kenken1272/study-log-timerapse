@@ -129,6 +129,109 @@ kill -TERM <PID>
 Never use `killall python` or a broad `pkill -f python` on this host — it runs
 other people's research jobs.
 
+## Timelapse rendering
+
+Rendering moved off Cloud Run onto this host. Cloud Run keeps the web app,
+Firestore, auth and cleanup scheduling; it no longer runs FFmpeg.
+
+```
+finish API -> metadata.json (endedAt)
+                    |
+        worker sees it, waits >= 60s, checks the sources are complete
+                    |
+        download -> ffmpeg -> ffprobe validate -> upload to GCS
+                    |
+        POST /api/internal/sessions/{id}/timelapse-complete  (OIDC)
+                    |
+        Cloud Run: Firestore ready + metadata.json + schedule 24h cleanup
+```
+
+### Encoder choice
+
+`libx264`, not NVENC — measured on this host with real chunks:
+
+| 360 chunks (~3h) | wall | encode portion | output |
+|---|---|---|---|
+| libx264 veryfast crf28 | 62.0s | 7.7s | **19.2 MB** |
+| h264_nvenc p4 cq28 | 54.8s | 0.5s | 30.4 MB |
+| decode only | 54.3s | — | — |
+
+Decode is 88% of the work: `setpts` makes ffmpeg decode every input frame and
+drop most of them, so a three-hour session decodes ~324k frames to emit ~2.7k.
+NVENC accelerates the part that was never the bottleneck and produces a file
+58% larger at matched quality. Since the point of the move is cost, the smaller
+file wins and GPU0's encoder stays free for the VLM.
+
+`TIMELAPSE_ENCODER=h264_nvenc` switches it back; NVENC failures fall back to
+libx264 automatically and record `fallback_used`.
+
+The exact command:
+
+```
+ffmpeg -y -hide_banner -loglevel error \
+  -f concat -safe 0 -i files.txt \
+  -filter:v setpts=PTS/<speed>,fps=30,scale=1280:-2 -an \
+  -c:v libx264 -preset veryfast -crf 28 \
+  -pix_fmt yuv420p -movflags +faststart timelapse.mp4
+```
+
+### When a render starts
+
+Never on a timer alone. All of these must hold:
+
+- `metadata.json` has `endedAt`, and >= 60s have passed since it was noticed
+- no chunk is still in a non-terminal state (RECEIVED/EXTRACTING/VLM_RUNNING/...)
+- `COMPLETED + DEAD_LETTER >= chunkCount` from metadata
+- the GCS chunk listing holds at least `chunkCount` distinct slots
+- without `chunkCount`, the listing must be unchanged for >= 60s (logged as a
+  weaker signal)
+- no other render is running
+
+Chunks that failed analysis do **not** block rendering — the source video is
+still there — but they are always logged.
+
+### Inspecting jobs
+
+```bash
+DB=~/study-timelapse-worker/state/pipeline.db
+sqlite3 "$DB" 'SELECT session_id,state,attempts,encoder,chunks_used,chunks_skipped
+               FROM timelapse_jobs ORDER BY updated_at DESC LIMIT 10;'
+```
+
+`CALLBACK_PENDING` means the video is rendered, validated and uploaded but
+Cloud Run has not confirmed. The worker retries only the callback — it does not
+re-encode.
+
+### Rollback
+
+Two independent switches; either alone stops new Ubuntu renders.
+
+**Cloud Run** — restores the original Cloud Tasks -> do-process -> FFmpeg path:
+
+```bash
+gcloud run services update study-timelapse --region asia-northeast1 \
+  --update-env-vars TIMELAPSE_BACKEND=cloudrun
+```
+
+**Ubuntu** — stops the worker rendering at all:
+
+```bash
+sed -i 's/^TIMELAPSE_ENABLED=.*/TIMELAPSE_ENABLED=0/' \
+  ~/study-timelapse-worker/config/worker.env
+systemctl --user restart study-timelapse-worker
+```
+
+Set both when rolling back deliberately: Cloud Run first, so nothing is
+rendering while the flag flips.
+
+Rolling back destroys nothing. GCS chunks, analysis JSON, existing
+timelapse.mp4 and thumbnail.jpg, Firestore sessions and the SQLite job rows
+(including attempt counts) all survive — the Ubuntu path simply stops being
+used, and sessions finished afterwards go through Cloud Run again.
+
+Videos already rendered on Ubuntu keep playing: the output paths, codec and
+Firestore fields are identical to what Cloud Run produced.
+
 ## Fatal CUDA errors
 
 Some CUDA errors are sticky: once raised, every subsequent CUDA call in that

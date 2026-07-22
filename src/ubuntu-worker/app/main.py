@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import aggregator, cuda_health, gpu_manager, result_store, video_frames
+from app import timelapse_trigger
 from app.gcs_client import ChunkGone, GcsClient, is_transient
 from app.health import HealthServer
 from app.llm_runtime import (
@@ -28,6 +29,10 @@ from app.llm_runtime import (
 from app.logging_config import configure as configure_logging
 from app.pubsub_consumer import PubSubConsumer
 from app.queue_db import (
+    TL_COMPLETED,
+    TL_DEAD_LETTER,
+    TL_READY,
+    TL_WAITING_FOR_CHUNKS,
     STATE_COMPLETED,
     STATE_EXTRACTING,
     STATE_UPLOADING,
@@ -43,6 +48,8 @@ from app.schemas import (
     utc_now_iso,
 )
 from app.settings import PROFILE_ORDER, Settings, load_settings
+from app.timelapse import TimelapseFatal
+from app.timelapse_job import TimelapseJobError, TimelapseRunner
 from app.vlm_runtime import SchemaViolation, build_runtime
 
 log = logging.getLogger(__name__)
@@ -78,6 +85,8 @@ class Worker:
         self._health: HealthServer | None = None
         self._last_chunk_ms = 0
         self._fatal_cuda: Exception | None = None
+        self._timelapse = TimelapseRunner(self.db, self.gcs, settings)
+        self._listing_tracker = timelapse_trigger.ListingTracker()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -87,6 +96,12 @@ class Worker:
         recovered = self.db.recover_in_flight()
         if recovered:
             log.info("recovered %d chunks abandoned by a previous run", recovered)
+
+        recovered_renders = self.db.recover_timelapse_jobs()
+        if recovered_renders:
+            log.info(
+                "recovered %d timelapse job(s) abandoned mid-render", recovered_renders
+            )
 
         stored_profile = self.db.get_meta("vlm_profile")
         if stored_profile in PROFILE_ORDER:
@@ -362,6 +377,9 @@ class Worker:
             if self._session_has_ended(uid, session_id):
                 self._finalize_session(uid, session_id)
 
+        if self.settings.timelapse_enabled:
+            self._tick_timelapses()
+
     def _session_has_ended(self, uid: str, session_id: str) -> bool:
         """Trust the app's own end signal rather than inventing a new one."""
         metadata = self.gcs.read_json(
@@ -449,6 +467,167 @@ class Worker:
                 uid, session_id, state="partial",
                 message="統合分析を再試行しています。",
             )
+
+    # ------------------------------------------------------------------
+    # Timelapse
+    # ------------------------------------------------------------------
+
+    def _tick_timelapses(self) -> None:
+        """Advance timelapse jobs. One render at a time, VLM always first."""
+        # Register a job for every ended session that does not have one. Cheap,
+        # idempotent, and means a session that ended while the worker was down
+        # still gets picked up.
+        for session in self.db.active_sessions():
+            if session["ended_at"]:
+                self.db.upsert_timelapse_job(
+                    session["session_id"], session["uid"], TL_WAITING_FOR_CHUNKS
+                )
+
+        if self.db.timelapse_job_in_progress():
+            return
+
+        for job in self.db.timelapse_jobs_awaiting():
+            session_id = job["session_id"]
+            uid = job["uid"]
+
+            if job["state"] == "CALLBACK_PENDING":
+                # Rendered and uploaded, but Cloud Run did not confirm. Retry
+                # only the callback rather than the whole render.
+                self._retry_timelapse_callback(job)
+                return
+
+            readiness = self._evaluate_timelapse_readiness(uid, session_id)
+            if not readiness.ready:
+                log.debug("timelapse %s not ready: %s", session_id, readiness.reason)
+                continue
+
+            for warning in readiness.warnings:
+                log.warning("timelapse %s: %s", session_id, warning)
+
+            self.db.set_timelapse_state(session_id, TL_READY)
+            if not self.db.claim_timelapse_job(session_id):
+                continue
+
+            self._render_timelapse(session_id, uid)
+            # One render per tick: the VLM shares this host, and a second
+            # concurrent ffmpeg would compete for the same cores.
+            return
+
+    def _evaluate_timelapse_readiness(self, uid: str, session_id: str):
+        """Gather the evidence the gate needs, then ask it."""
+        counts = self.db.session_counts(session_id)
+        counts.pop("TOTAL", None)
+
+        try:
+            objects = self.gcs.list_chunk_objects(uid, session_id)
+        except Exception as error:
+            log.warning("timelapse %s: could not list chunks: %s", session_id, error)
+            return timelapse_trigger.ReadinessResult(
+                False, f"chunk listing failed: {error}", []
+            )
+
+        # Distinct slots, not object count: a re-uploaded chunk is the same
+        # moment in the recording, not an extra one.
+        slots = {
+            (entry["object_name"].rsplit("/segments/", 1)[-1])
+            for entry in objects
+        }
+        stable_for = self._listing_tracker.observe(
+            session_id, [e["object_name"] + "#" + e["generation"] for e in objects]
+        )
+
+        metadata = self.gcs.read_json(
+            f"{result_store.session_prefix(uid, session_id)}metadata.json"
+        )
+        session_meta = (metadata or {}).get("session") or {}
+        expected = session_meta.get("chunkCount")
+        expected = int(expected) if isinstance(expected, int) and expected >= 0 else None
+
+        ended_at = self.db.finalization_requested_at(session_id)
+
+        return timelapse_trigger.evaluate_readiness(
+            ended_at=ended_at,
+            now=time.time(),
+            chunk_states=counts,
+            observed_chunk_slots=len(slots),
+            expected_chunk_count=expected,
+            listing_stable_for_sec=stable_for,
+        )
+
+    def _session_speed(self, uid: str, session_id: str) -> int:
+        """Prefer the speed the app recorded; otherwise compute it identically."""
+        from app.timelapse import auto_timelapse_speed
+
+        metadata = self.gcs.read_json(
+            f"{result_store.session_prefix(uid, session_id)}metadata.json"
+        )
+        session_meta = (metadata or {}).get("session") or {}
+        speed = session_meta.get("speed")
+        if isinstance(speed, int) and speed in (30, 60, 120):
+            return speed
+
+        actual = session_meta.get("actualStudySec")
+        actual = float(actual) if isinstance(actual, (int, float)) else 0.0
+        derived = auto_timelapse_speed(actual)
+        log.info(
+            "timelapse %s: metadata had no speed; derived %d from %.0fs",
+            session_id, derived, actual,
+        )
+        return derived
+
+    def _render_timelapse(self, session_id: str, uid: str) -> None:
+        speed = self._session_speed(uid, session_id)
+        try:
+            metrics = self._timelapse.run(session_id, uid, speed)
+            log.info("timelapse metrics %s", metrics)
+            self._listing_tracker.forget(session_id)
+            self._publish_status(uid, session_id, state="ready")
+        except TimelapseFatal as error:
+            # Nothing about retrying changes the input.
+            log.error("timelapse %s cannot succeed: %s", session_id, error)
+            self.db.set_timelapse_state(
+                session_id, TL_DEAD_LETTER,
+                error_class="fatal", error_message=str(error)[:2000],
+            )
+        except Exception as error:
+            state = self.db.fail_timelapse_job(
+                session_id, type(error).__name__, str(error)
+            )
+            log.warning("timelapse %s -> %s: %s", session_id, state, error)
+
+    def _retry_timelapse_callback(self, job) -> None:
+        """The render succeeded; only Cloud Run needs telling."""
+        session_id = job["session_id"]
+        log.info("retrying completion callback for %s", session_id)
+        try:
+            video = self.gcs.stat(job["output_object"])
+            thumb = self.gcs.stat(job["thumbnail_object"])
+            if not video:
+                raise TimelapseJobError("uploaded timelapse is missing; re-rendering")
+
+            class _Result:
+                duration_sec = job["duration_sec"] or 0.0
+                encoder = job["encoder"] or "libx264"
+                fallback_used = bool(job["fallback_used"])
+
+            self._timelapse.notify_complete(
+                session_id=session_id,
+                uid=job["uid"],
+                fingerprint=job["source_fingerprint"],
+                video_object=job["output_object"],
+                thumb_object=job["thumbnail_object"],
+                video_meta=video,
+                thumb_meta=thumb or {"generation": "", "size_bytes": 0},
+                result=_Result(),
+                speed=self._session_speed(job["uid"], session_id),
+            )
+            self.db.set_timelapse_state(
+                session_id, TL_COMPLETED, completed_at=time.time()
+            )
+            self._publish_status(job["uid"], session_id, state="ready")
+        except Exception as error:
+            state = self.db.fail_timelapse_job(session_id, "callback", str(error))
+            log.warning("timelapse callback %s -> %s: %s", session_id, state, error)
 
     def _expected_chunk_count(self, uid: str, session_id: str) -> int | None:
         """How many chunks the app says this session recorded, if it says."""

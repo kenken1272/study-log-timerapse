@@ -76,6 +76,11 @@ class Settings:
     llm_max_output_tokens: int
     llm_fallback_model_id: str
 
+    # --- Timelapse ---
+    timelapse_enabled: bool
+    timelapse_encoder: str
+    cloud_run_url: str
+
     # --- Pipeline behaviour ---
     window_minutes: int
     max_attempts: int
@@ -132,6 +137,16 @@ def load_settings() -> Settings:
         llm_max_output_tokens=_env_int("LLM_MAX_OUTPUT_TOKENS", 1200),
         llm_fallback_model_id=os.environ.get(
             "LLM_FALLBACK_MODEL_ID", "google/gemma-3-12b-it"
+        ),
+        # Measured on this host: the render is VP8-decode-bound, so libx264
+        # costs ~7s more than NVENC on a 3-hour session but produces a file 58%
+        # smaller. Since the point of moving off Cloud Run is cost, the smaller
+        # file wins. Set TIMELAPSE_ENCODER=h264_nvenc to trade back.
+        timelapse_enabled=_env_bool("TIMELAPSE_ENABLED", False),
+        timelapse_encoder=os.environ.get("TIMELAPSE_ENCODER", "libx264"),
+        cloud_run_url=os.environ.get(
+            "CLOUD_RUN_SERVICE_URL",
+            "https://study-timelapse-116342725707.asia-northeast1.run.app",
         ),
         window_minutes=_env_int("WINDOW_MINUTES", 30),
         max_attempts=_env_int("MAX_ATTEMPTS", 5),

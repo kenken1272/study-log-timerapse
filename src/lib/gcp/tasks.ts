@@ -106,6 +106,20 @@ export async function enqueueTimelapseProcessingTask(sessionId: string): Promise
   });
 }
 
+/**
+ * Which host renders timelapses.
+ *
+ * "ubuntu" moves FFmpeg off Cloud Run onto the lab GPU box, which is the point
+ * of the change — Cloud Run was billing CPU-seconds for a decode-bound job that
+ * takes ~62s for a three-hour session. "cloudrun" keeps the original path and
+ * is the rollback.
+ */
+export type TimelapseBackend = "cloudrun" | "ubuntu";
+
+export function getTimelapseBackend(): TimelapseBackend {
+  return process.env.TIMELAPSE_BACKEND === "ubuntu" ? "ubuntu" : "cloudrun";
+}
+
 export function getChunkCleanupDelaySeconds(): number {
   const raw = Number(process.env.CHUNK_CLEANUP_DELAY_SEC);
   if (!Number.isFinite(raw) || raw < 0) {

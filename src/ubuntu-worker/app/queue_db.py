@@ -49,6 +49,31 @@ IN_FLIGHT_STATES = (
     STATE_UPLOADING,
 )
 
+# Timelapse job states.
+TL_WAITING_FOR_CHUNKS = "WAITING_FOR_CHUNKS"
+TL_READY = "READY"
+TL_DOWNLOADING = "DOWNLOADING"
+TL_ENCODING = "ENCODING"
+TL_VALIDATING = "VALIDATING"
+TL_UPLOADING = "UPLOADING"
+TL_CALLBACK_PENDING = "CALLBACK_PENDING"
+TL_COMPLETED = "COMPLETED"
+TL_RETRY = "RETRY"
+TL_DEAD_LETTER = "DEAD_LETTER"
+
+# States that mean a render was in flight when the process died. On startup
+# they rewind to READY: the work is repeatable and the partial output was never
+# published, because output is only promoted after validation.
+TL_IN_FLIGHT = (
+    TL_DOWNLOADING,
+    TL_ENCODING,
+    TL_VALIDATING,
+    TL_UPLOADING,
+)
+
+MAX_TIMELAPSE_ATTEMPTS = 5
+TIMELAPSE_MAX_BACKOFF_SEC = 3600.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
   idempotency_key TEXT PRIMARY KEY,
@@ -114,6 +139,36 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- One timelapse render per session. Keyed by session_id so a duplicate trigger
+-- cannot start a second render; source_fingerprint records exactly which chunk
+-- generations went in, so a late or re-uploaded chunk is detectable as a
+-- genuine change rather than confused with a repeat of the same work.
+CREATE TABLE IF NOT EXISTS timelapse_jobs (
+  session_id         TEXT PRIMARY KEY,
+  uid                TEXT NOT NULL,
+  state              TEXT NOT NULL,
+  attempts           INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at    REAL NOT NULL DEFAULT 0,
+  error_class        TEXT,
+  error_message      TEXT,
+  source_fingerprint TEXT,
+  output_object      TEXT,
+  thumbnail_object   TEXT,
+  encoder            TEXT,
+  fallback_used      INTEGER NOT NULL DEFAULT 0,
+  duration_sec       REAL,
+  size_bytes         INTEGER,
+  chunks_used        INTEGER,
+  chunks_skipped     INTEGER,
+  started_at         REAL,
+  completed_at       REAL,
+  created_at         REAL NOT NULL,
+  updated_at         REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_timelapse_state
+  ON timelapse_jobs(state, next_attempt_at);
 """
 
 
@@ -530,6 +585,129 @@ class QueueDB:
             "ORDER BY window_start ASC",
             (session_id, "DONE"),
         )
+
+    # ------------------------------------------------------------------
+    # Timelapse jobs
+    # ------------------------------------------------------------------
+
+    def upsert_timelapse_job(self, session_id: str, uid: str, state: str) -> bool:
+        """Create the job if absent. Returns True when it was created."""
+        now = _now()
+        with self._tx() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO timelapse_jobs (session_id, uid, state,"
+                " created_at, updated_at) VALUES (?,?,?,?,?)",
+                (session_id, uid, state, now, now),
+            )
+            return cursor.rowcount > 0
+
+    def get_timelapse_job(self, session_id: str):
+        rows = self._query(
+            "SELECT * FROM timelapse_jobs WHERE session_id=?", (session_id,)
+        )
+        return rows[0] if rows else None
+
+    def set_timelapse_state(self, session_id: str, state: str, **fields) -> None:
+        assignments = ["state=?", "updated_at=?"]
+        values: list[object] = [state, _now()]
+        for name, value in fields.items():
+            assignments.append(f"{name}=?")
+            values.append(value)
+        values.append(session_id)
+        with self._tx() as conn:
+            conn.execute(
+                f"UPDATE timelapse_jobs SET {', '.join(assignments)} WHERE session_id=?",
+                values,
+            )
+
+    def claim_timelapse_job(self, session_id: str) -> bool:
+        """Take exclusive ownership of a render.
+
+        False means: already running, already completed, still backing off, or
+        given up on. Only one render runs at a time across the whole worker —
+        see claim_any_timelapse_job.
+        """
+        now = _now()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT state, attempts, next_attempt_at FROM timelapse_jobs"
+                " WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] not in (TL_READY, TL_RETRY, TL_WAITING_FOR_CHUNKS):
+                return False
+            if (row["next_attempt_at"] or 0) > now:
+                return False
+            if row["attempts"] >= MAX_TIMELAPSE_ATTEMPTS:
+                conn.execute(
+                    "UPDATE timelapse_jobs SET state=?, updated_at=? WHERE session_id=?",
+                    (TL_DEAD_LETTER, now, session_id),
+                )
+                return False
+            conn.execute(
+                "UPDATE timelapse_jobs SET state=?, attempts=attempts+1,"
+                " started_at=?, updated_at=? WHERE session_id=?",
+                (TL_DOWNLOADING, now, now, session_id),
+            )
+            return True
+
+    def timelapse_job_in_progress(self) -> bool:
+        """True when any render holds the single concurrency slot."""
+        placeholders = ",".join("?" * len(TL_IN_FLIGHT))
+        rows = self._query(
+            f"SELECT 1 FROM timelapse_jobs WHERE state IN ({placeholders}) LIMIT 1",
+            TL_IN_FLIGHT,
+        )
+        return bool(rows)
+
+    def timelapse_jobs_awaiting(self) -> list:
+        """Jobs that want attention, oldest first."""
+        now = _now()
+        return self._query(
+            "SELECT * FROM timelapse_jobs WHERE state IN (?,?,?,?)"
+            " AND next_attempt_at <= ? ORDER BY created_at ASC",
+            (TL_WAITING_FOR_CHUNKS, TL_READY, TL_RETRY, TL_CALLBACK_PENDING, now),
+        )
+
+    def fail_timelapse_job(
+        self, session_id: str, error_class: str, message: str
+    ) -> str:
+        """Back off, or give up once the ceiling is reached."""
+        row = self.get_timelapse_job(session_id)
+        attempts = row["attempts"] if row else MAX_TIMELAPSE_ATTEMPTS
+        if attempts >= MAX_TIMELAPSE_ATTEMPTS:
+            self.set_timelapse_state(
+                session_id, TL_DEAD_LETTER,
+                error_class=error_class, error_message=message[:2000],
+            )
+            return TL_DEAD_LETTER
+
+        delay = min(60.0 * (2 ** min(attempts, 6)), TIMELAPSE_MAX_BACKOFF_SEC)
+        self.set_timelapse_state(
+            session_id, TL_RETRY,
+            error_class=error_class,
+            error_message=message[:2000],
+            next_attempt_at=_now() + random.uniform(delay / 2, delay),
+        )
+        return TL_RETRY
+
+    def recover_timelapse_jobs(self) -> int:
+        """Rewind renders abandoned by a previous process.
+
+        Safe because output is only published after validation, so an
+        interrupted render left nothing behind that anyone can see.
+        """
+        now = _now()
+        placeholders = ",".join("?" * len(TL_IN_FLIGHT))
+        with self._tx() as conn:
+            cursor = conn.execute(
+                f"UPDATE timelapse_jobs SET state=?, next_attempt_at=0, updated_at=?"
+                f" WHERE state IN ({placeholders})",
+                (TL_READY, now, *TL_IN_FLIGHT),
+            )
+            return cursor.rowcount
 
     # ------------------------------------------------------------------
     # Meta

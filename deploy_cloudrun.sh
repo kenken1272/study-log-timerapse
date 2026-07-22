@@ -263,6 +263,11 @@ const runtimeKeys = [
   // Grace period before source chunks are deleted, so the Ubuntu VLM pipeline
   // can still read them. Falls back to 24h in code when unset.
   "CHUNK_CLEANUP_DELAY_SEC",
+  // "ubuntu" moves FFmpeg off Cloud Run; "cloudrun" is the rollback.
+  "TIMELAPSE_BACKEND",
+  // Audience and caller identity for the Ubuntu worker's completion callback.
+  "WORKER_CALLBACK_AUDIENCE",
+  "WORKER_SERVICE_ACCOUNT_EMAIL",
 ];
 const buildKeys = [
   "NEXT_PUBLIC_APP_NAME",
