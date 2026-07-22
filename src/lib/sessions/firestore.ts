@@ -161,6 +161,11 @@ function snapshotToSession(
     reflectionNote: data.reflectionNote ?? null,
     timelapsePath: data.timelapsePath ?? null,
     timelapseSizeBytes: data.timelapseSizeBytes ?? null,
+    // Mapped explicitly: this object is built field by field, so a stored
+    // value that is not listed here is silently dropped on read. Leaving it
+    // out made the completion callback's duplicate check compare against
+    // undefined and re-schedule cleanup on every retry.
+    timelapseFingerprint: data.timelapseFingerprint ?? null,
     thumbnailPath: data.thumbnailPath ?? null,
     errorMessage: data.errorMessage ?? null,
     analysisStatus: data.analysisStatus ?? "none",
