@@ -14,6 +14,11 @@ from pathlib import Path
 
 import google.auth
 import google.auth.transport.requests
+# Imported at module scope on purpose: a conditional "import google.oauth2..."
+# inside fetch_id_token would make `google` a local name for that whole
+# function and shadow these.
+import google.oauth2.id_token
+from google.auth import impersonated_credentials
 
 from app import auth as worker_auth
 from app import result_store, timelapse
@@ -52,8 +57,6 @@ def fetch_id_token(audience: str) -> str:
     impersonation API mints the ID token instead, and include_email is required
     because Cloud Run authorises on the email claim, not just the audience.
     """
-    from google.auth import impersonated_credentials
-
     target = worker_auth.target_service_account()
     source, _project = google.auth.default(
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
@@ -62,8 +65,6 @@ def fetch_id_token(audience: str) -> str:
     if not target:
         # No impersonation configured: ADC may already be a service account
         # that can self-sign an ID token.
-        import google.oauth2.id_token
-
         return google.oauth2.id_token.fetch_id_token(
             google.auth.transport.requests.Request(), audience
         )

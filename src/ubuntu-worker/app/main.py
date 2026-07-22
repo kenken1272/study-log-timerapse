@@ -496,6 +496,17 @@ class Worker:
                 self._retry_timelapse_callback(job)
                 return
 
+            if self._already_rendered(uid, session_id):
+                # Rendered by Cloud Run before the migration, or by an earlier
+                # run here, and the sources have since been cleaned up. Nothing
+                # to do — and without this the job would be re-evaluated, and
+                # its chunk listing re-fetched, every minute forever.
+                log.info("timelapse %s already exists and sources are gone; done",
+                         session_id)
+                self.db.set_timelapse_state(session_id, TL_COMPLETED)
+                self._listing_tracker.forget(session_id)
+                continue
+
             readiness = self._evaluate_timelapse_readiness(uid, session_id)
             if not readiness.ready:
                 log.debug("timelapse %s not ready: %s", session_id, readiness.reason)
@@ -512,6 +523,21 @@ class Worker:
             # One render per tick: the VLM shares this host, and a second
             # concurrent ffmpeg would compete for the same cores.
             return
+
+    def _already_rendered(self, uid: str, session_id: str) -> bool:
+        """True when a timelapse exists and no source chunks remain.
+
+        Both halves matter. A timelapse alone is not enough — a late chunk can
+        legitimately require a re-render — but once the sources are gone there
+        is nothing left to render from either way.
+        """
+        try:
+            if self.gcs.list_chunk_objects(uid, session_id):
+                return False
+            return self.gcs.stat(result_store.timelapse_path(uid, session_id)) is not None
+        except Exception:
+            log.debug("could not check existing render for %s", session_id, exc_info=True)
+            return False
 
     def _evaluate_timelapse_readiness(self, uid: str, session_id: str):
         """Gather the evidence the gate needs, then ask it."""

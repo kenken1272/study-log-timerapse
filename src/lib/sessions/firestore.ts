@@ -559,12 +559,20 @@ export async function updateSessionReady(
   timelapsePath: string,
   timelapseSizeBytes: number,
   thumbnailPath: string | null,
+  /**
+   * Identifies the exact set of source chunks this render consumed. Only the
+   * Ubuntu renderer supplies it; it is what lets a repeated completion
+   * callback be recognised as a repeat rather than a new result, so cleanup is
+   * scheduled once. The Cloud Run path has no equivalent and omits it.
+   */
+  timelapseFingerprint?: string,
 ): Promise<void> {
   await sessionCollection().doc(sessionId).update({
     status: "ready",
     timelapsePath,
     timelapseSizeBytes,
     thumbnailPath,
+    ...(timelapseFingerprint ? { timelapseFingerprint } : {}),
     analysisStatus: "none" satisfies AnalysisStatus,
     updatedAt: Timestamp.now(),
   });

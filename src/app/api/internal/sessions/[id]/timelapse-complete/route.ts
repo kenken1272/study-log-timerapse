@@ -96,8 +96,7 @@ export async function POST(request: Request, context: RouteContext) {
     if (
       session.status === "ready" &&
       session.timelapsePath === timelapsePath &&
-      asString((session as { timelapseFingerprint?: unknown }).timelapseFingerprint) ===
-        fingerprint
+      asString(session.timelapseFingerprint) === fingerprint
     ) {
       return NextResponse.json({ ok: true, duplicate: true }, { status: 200 });
     }
@@ -144,7 +143,7 @@ export async function POST(request: Request, context: RouteContext) {
       console.warn(`[timelapse-complete] no thumbnail at ${thumbnailPath} for ${id}`);
     }
 
-    await updateSessionReady(id, timelapsePath, sizeBytes, resolvedThumbnail);
+    await updateSessionReady(id, timelapsePath, sizeBytes, resolvedThumbnail, fingerprint);
 
     const readySession = await getSession(id);
     if (readySession) {

@@ -98,6 +98,13 @@ export type StudySession = {
   reflectionNote: string | null;
   timelapsePath: string | null;
   timelapseSizeBytes: number | null;
+  /**
+   * Which set of source chunks produced the current timelapse. Written only by
+   * the Ubuntu renderer, so a repeated completion callback is recognisable as
+   * a repeat and cleanup is scheduled once. Absent on Cloud Run renders and on
+   * anything created before the migration.
+   */
+  timelapseFingerprint?: string | null;
   thumbnailPath: string | null;
   errorMessage: string | null;
   analysisStatus: AnalysisStatus;
